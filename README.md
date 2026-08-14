@@ -61,6 +61,19 @@ servicio `normalizador`). La configuración está versionada en `railway.json`:
 "deploy": { "cronSchedule": "0 * * * *", "restartPolicyType": "NEVER" }
 ```
 
+> **Trampa importante.** `railway.json` llega al manifest del deployment pero
+> **no** configura el scheduler: Railway lee `cronSchedule` del *service
+> instance*. Un servicio desplegado solo con `railway.json` construye la imagen
+> y **nunca la ejecuta** — los síntomas son deployments con `buildOnly: true`,
+> logs vacíos y `serviceInstance.cronSchedule = null`.
+>
+> Después de crear el servicio o de cambiar el horario, aplicá los settings:
+>
+> ```bash
+> python scripts/railway_setup.py          # aplica y verifica
+> python scripts/railway_setup.py --show   # solo reporta
+> ```
+
 `job.py` es el entrypoint del scheduler: sin argumentos, siempre datos frescos,
 sin Excel, y **sale con código distinto de cero si falla** para que la corrida
 quede marcada como fallida. El contenedor debe terminar rápido — Railway
