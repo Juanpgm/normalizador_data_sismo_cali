@@ -33,13 +33,14 @@ def _print_history(log_dir, limit: int = 8) -> None:
     history = runlog.read_runs(log_dir, limit=limit)
     if not history:
         return
-    print(f"\nÚltimas {len(history)} corridas:")
+    print(f"\nÚltimas {len(history)} corridas (hora Colombia):")
     for row in history:
         estado = row.get("estado", "?")
         detail = (f"{row.get('registros_publicados', '?')} registros · "
                   f"{row.get('tasa_match_pct', '?')}% match"
                   if estado == "ok" else row.get("error", ""))
-        print(f"  {row.get('timestamp_utc', '?')}  {estado:5s}  "
+        stamp = row.get("timestamp_bogota") or row.get("timestamp_utc", "?")
+        print(f"  {stamp}  {estado:5s}  "
               f"{row.get('duracion_seg', '?')}s  {detail}")
     print()
 
@@ -49,8 +50,10 @@ def main() -> int:
     log_dir = runlog.resolve_log_dir()
     restore = runlog.start_tee(log_dir)
 
+    from integracion.config import BOGOTA_TZ
     print("=" * 60)
-    print(f"Corrida programada · inicio {started_at:%Y-%m-%d %H:%M:%S} UTC")
+    print(f"Corrida programada · inicio "
+          f"{started_at.astimezone(BOGOTA_TZ):%Y-%m-%d %H:%M:%S} hora Colombia")
     print(f"Logs: {log_dir or 'solo stdout (sin volumen escribible)'}")
     try:
         print(f"Service account: {service_account_email()}")
@@ -61,6 +64,7 @@ def main() -> int:
 
     try:
         artifacts = run(use_cache=False, with_embedding=True, with_bridge=True,
+                        with_exif=True, with_geocode=True, with_geo_key=True,
                         export=False)
         metrics.print_report(artifacts["report"])
 

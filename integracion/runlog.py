@@ -18,10 +18,11 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
-BOGOTA = timezone(timedelta(hours=-5))
+from .config import BOGOTA_TZ
+
 DEFAULT_LOG_DIR = "/data/logs"
 MAX_BYTES = 5 * 1024 * 1024
 BACKUP_COUNT = 5
@@ -82,7 +83,7 @@ class _LineWriter:
         self._fh = open(self._path, "a", encoding="utf-8")
 
     def emit_text(self, text):
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        stamp = datetime.now(BOGOTA_TZ).strftime("%Y-%m-%d %H:%M:%S")
         for line in text.splitlines():
             self._fh.write(f"{stamp}  {line}\n")
         self._fh.flush()
@@ -124,8 +125,8 @@ def append_run(log_dir: Path | None, record: dict) -> None:
     if log_dir is None:
         return
     now = datetime.now(timezone.utc)
-    row = {"timestamp_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
-           "timestamp_bogota": now.astimezone(BOGOTA).strftime("%Y-%m-%d %H:%M:%S"),
+    row = {"timestamp_bogota": now.astimezone(BOGOTA_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+           "timestamp_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
            **record}
     try:
         with open(log_dir / RUNS_FILE, "a", encoding="utf-8") as fh:

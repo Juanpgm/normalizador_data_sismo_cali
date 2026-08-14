@@ -25,10 +25,13 @@ def compute_trust(match_table: pd.DataFrame, emb, df_edan, df_visitas,
       - geo: <=60m +.05 · >250m -.12
       - surrogate spatial-bridge: -.10 (coordinate-only, volunteer-entered)
     """
+    from .matching import geocoded_flags
+
     E = df_edan.reset_index(drop=True)
     V = df_visitas.reset_index(drop=True)
     e_geo = [parse_latlon(x) for x in E["coords"]]
     v_geo = [parse_latlon(x) for x in V["coords"]]
+    e_gc, v_gc = geocoded_flags(E), geocoded_flags(V)
     surrogate_bridge_vids = surrogate_bridge_vids or set()
 
     def match_trust(visita_id, sitio_id, method) -> float:
@@ -48,12 +51,18 @@ def compute_trust(match_table: pd.DataFrame, emb, df_edan, df_visitas,
         if b1 not in _EMB_EMPTY and b2 not in _EMB_EMPTY:
             t += 0.03 if fuzz.token_sort_ratio(b1.upper(), b2.upper()) >= 75 else -0.08
 
-        if v_geo[j] and e_geo[i]:
+        # Geographic corroboration — but not when BOTH coordinates were
+        # geocoded from the very addresses this match compared: two outputs of
+        # the same geocoder agreeing is the pipeline vouching for itself.
+        if v_geo[j] and e_geo[i] and not (v_gc[j] and e_gc[i]):
             dm = haversine_m(v_geo[j], e_geo[i])
             if dm <= 60:
                 t += 0.05
             elif dm > 250:
                 t -= 0.12
+
+        if method == "geo" and (v_gc[j] or e_gc[i]):
+            t -= 0.05   # the match itself leaned on a derived coordinate
 
         if method == "spatial_bridge" and visita_id in surrogate_bridge_vids:
             t -= 0.10   # coordinate-only surrogate on volunteer-entered data
@@ -67,7 +76,21 @@ def compute_trust(match_table: pd.DataFrame, emb, df_edan, df_visitas,
         for _, r in match_table.iterrows()
     ]
 
-    reject = match_table["trust"].notna() & (match_table["trust"] < TRUST_MIN)
+    return apply_cutoff(match_table)
+
+
+def apply_cutoff(match_table: pd.DataFrame) -> pd.DataFrame:
+    """Revert low-trust matches to unmatched — except declared identities.
+
+    ``preregistro`` is exempt: the responder wrote the EDAN consecutive on the
+    form, so the site is stated, not inferred. The penalties that push it down
+    (barrio disagreement, distance, weak semantics) are precisely the guesswork
+    the consecutive overrides. Its trust score still carries them, so a shaky
+    one is visible to a reviewer instead of silently deleted.
+    """
+    declared = match_table["match_method"] == "preregistro"
+    reject = (match_table["trust"].notna() & (match_table["trust"] < TRUST_MIN)
+              & ~declared)
     if reject.any():
         match_table.loc[reject, ["sitio_id", "match_method", "match_score", "trust"]] = \
             [None, None, None, None]

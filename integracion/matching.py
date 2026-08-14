@@ -15,8 +15,8 @@ import pandas as pd
 from rapidfuzz import fuzz, process
 
 from .config import (
-    BLOCK_PLACA_TOL, FUZZY_MIN_LEN, FUZZY_THRESHOLD, GEO_FAR_M, GEO_NEAR_M,
-    TFIDF_MIN, VECTOR_TOL,
+    BLOCK_PLACA_TOL, FUZZY_MIN_LEN, FUZZY_THRESHOLD, GEO_FAR_M, GEO_KEY_MARGIN_M,
+    GEO_KEY_MAX_M, GEO_NEAR_M, TFIDF_MIN, VECTOR_TOL,
 )
 from .coords import haversine_m, parse_latlon
 from .normalization import address_to_vector, make_handshake
@@ -111,7 +111,59 @@ def corner_key(canon, vec):
     return tuple(sorted((rn, cn))) if cn else None
 
 
-# ── Confidence cascade (tiers 1-7) ────────────────────────────────────────────
+# ── Coordinate provenance ─────────────────────────────────────────────────────
+def geocoded_flags(df) -> list[bool]:
+    """Per-row: is this coordinate geocoded from the address (vs measured/typed)?
+
+    A geo match between two geocoded points is address matching in disguise —
+    both coordinates derive from the very addresses the text tiers already
+    compare, with the geocoder's error bars added on top. The geographic tiers
+    use these flags to demand at least one independently-sourced side.
+    """
+    if "coords_fuente" in df.columns:
+        return [str(f) == "geocode" for f in df["coords_fuente"]]
+    return [False] * len(df)
+
+
+# ── Pre-registration key ──────────────────────────────────────────────────────
+_CONSECUTIVO_RE = re.compile(r'^[1-9]\d{0,4}$')
+
+
+def clean_consecutivo(value) -> str:
+    """The GRED running number as a join key, or '' when it is not one.
+
+    Volunteers answer this field freely, so it arrives full of prose ("No",
+    "No tengo", "Fue asignado") and of placeholders ("0", "00"). Only a plain
+    positive integer without leading zeros is a key; everything else is noise.
+    """
+    s = str(value).strip()
+    return s if _CONSECUTIVO_RE.match(s) else ""
+
+
+def build_preregistro_index(df_edan) -> dict[str, int]:
+    """``{consecutivo: edan_row}`` for consecutives that identify exactly one site.
+
+    A number repeated across EDAN rows identifies nothing, so it is dropped
+    rather than resolved arbitrarily.
+    """
+    if "consecutivo_edan" not in df_edan.columns:
+        return {}
+    index: dict[str, int] = {}
+    duplicated: set[str] = set()
+    for i, raw in enumerate(df_edan["consecutivo_edan"]):
+        key = clean_consecutivo(raw)
+        if not key:
+            continue
+        if key in index:
+            duplicated.add(key)
+        else:
+            index[key] = i
+    for key in duplicated:
+        index.pop(key, None)
+    return index
+
+
+# ── Confidence cascade (tiers 0-7) ────────────────────────────────────────────
 def build_match_table(df_edan, df_visitas,
                       vector_tol: float = VECTOR_TOL,
                       block_placa_tol: float = BLOCK_PLACA_TOL,
@@ -119,10 +171,11 @@ def build_match_table(df_edan, df_visitas,
                       tfidf_min: float = TFIDF_MIN,
                       fuzzy_threshold: float = FUZZY_THRESHOLD,
                       fuzzy_min_len: int = FUZZY_MIN_LEN) -> pd.DataFrame:
-    """7-tier cascade ordered by confidence, first hit wins.
+    """8-tier cascade ordered by confidence, first hit wins.
 
-    Tiers: handshake · vector · vector_block · corner · geo · tfidf · fuzzy.
-    Returns one row per visita: visita_id | sitio_id | match_method | match_score.
+    Tiers: preregistro · handshake · vector · vector_block · corner · geo ·
+    tfidf · fuzzy. Returns one row per visita:
+    visita_id | sitio_id | match_method | match_score.
     """
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -154,10 +207,11 @@ def build_match_table(df_edan, df_visitas,
         if ck:
             corner_index.setdefault(ck, []).append(i)
 
-    # Tier 5 pool: parseable WGS84 coordinates
+    # Tier 5 pool: parseable WGS84 coordinates (+ provenance for the guard)
     e_geo = [parse_latlon(x) for x in E["coords"]]
     v_geo = [parse_latlon(x) for x in V["coords"]]
     e_geo_idx = [i for i, g in enumerate(e_geo) if g]
+    e_gc, v_gc = geocoded_flags(E), geocoded_flags(V)
 
     # Tier 6/7 pool: canonical address + barrio as similarity text
     def txt(canon, barrio):
@@ -169,13 +223,27 @@ def build_match_table(df_edan, df_visitas,
     vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4))
     Xe = vectorizer.fit_transform(e_texts)
 
+    # Tier 0 index: the EDAN running number the responder wrote on the form
+    prereg_index = build_preregistro_index(E)
+    v_consecutivo = (V["consecutivo_gred"].map(clean_consecutivo)
+                     if "consecutivo_gred" in V.columns else pd.Series([""] * len(V)))
+
     rows = []
     for j in range(len(V)):
         addr, vv = v_canon.iloc[j], v_vecs[j]
         sid = method = score = None
 
+        # 0. preregistro — the visita carries the EDAN consecutive itself. This
+        # is a declared identity, not an inference, so it outranks everything;
+        # the barrio guard is there only to catch a mistyped number.
+        key = v_consecutivo.iloc[j]
+        if key and key in prereg_index:
+            i = prereg_index[key]
+            if barrio_ok(v_barrio[j], e_barrio[i]):
+                sid, method, score = e_sids[i], "preregistro", 100.0
+
         # 1. handshake
-        if addr:
+        if sid is None and addr:
             k = make_handshake(addr)
             if k and "#" in k and k in hs_index:
                 sid, method, score = e_sids[hs_index[k]], "handshake", 100.0
@@ -214,6 +282,8 @@ def build_match_table(df_edan, df_visitas,
         if sid is None and v_geo[j] and e_geo_idx:
             dists = sorted((haversine_m(v_geo[j], e_geo[i]), i) for i in e_geo_idx)
             for dm, i in dists[:3]:
+                if v_gc[j] and e_gc[i]:      # both geocoded → circular, skip
+                    continue
                 edan_unparseable = e_vecs[i][0] == 0
                 limit = geo_far_m if edan_unparseable else geo_near_m
                 if dm <= limit and coherent(vv, e_vecs[i], strict=False):
@@ -246,3 +316,98 @@ def build_match_table(df_edan, df_visitas,
                      "match_method": method, "match_score": score})
 
     return pd.DataFrame(rows)
+
+
+# ── Geo key: last-resort tier, runs AFTER the trust cutoff ────────────────────
+def add_geo_key_matches(match_table, df_edan, df_visitas,
+                        max_m: float = GEO_KEY_MAX_M,
+                        margin_m: float = GEO_KEY_MARGIN_M) -> tuple[pd.DataFrame, dict]:
+    """Match on the coordinate ALONE, for visitas nothing else could place.
+
+    The address tiers refuse a match when the street numbers disagree, and the
+    trust cutoff throws away whatever it does not believe. What is left over is
+    a visita with a coordinate and no site. When that coordinate is measured
+    (EXIF GPS) rather than typed, proximity is real evidence — so it gets one
+    last chance here.
+
+    Proximity on its own is not enough to be a KEY, though. Two guards:
+
+    * the nearest EDAN site must sit within ``max_m``; and
+    * the runner-up must be at least ``margin_m`` farther away.
+
+    The second is the one that matters. If two sites are both nearby, the
+    coordinate does not identify either of them, and an unmatched visita is far
+    better than a confidently wrong one.
+
+    Returns the augmented table and an info dict. Trust is assigned here rather
+    than by ``compute_trust`` because this tier runs after the cutoff.
+    """
+    from .config import METHOD_TRUST_BASE, TRUST_MIN
+
+    E, V = df_edan.reset_index(drop=True), df_visitas.reset_index(drop=True)
+    out = match_table.copy()
+    info = {"candidatas": 0, "added": 0, "rechazadas_ambiguas": 0,
+            "rechazadas_lejos": 0, "rechazadas_circular": 0, "rechazadas_trust": 0}
+
+    e_geo = [(i, parse_latlon(x)) for i, x in enumerate(E["coords"])]
+    e_geo = [(i, g) for i, g in e_geo if g]
+    if not e_geo:
+        return out, info
+
+    e_sids = E["sitio_id"].to_numpy()
+    e_barrio = E["barrio_vereda"].astype(str).to_numpy()
+    e_gc = geocoded_flags(E)
+    v_geo = {v: parse_latlon(c) for v, c in zip(V["visita_id"], V["coords"])}
+    v_barrio = dict(zip(V["visita_id"], V["barrio_vereda"].astype(str)))
+    v_fuente = (dict(zip(V["visita_id"], V["coords_fuente"].astype(str)))
+                if "coords_fuente" in V.columns else {})
+
+    unmatched = out["sitio_id"].isna()
+    base = METHOD_TRUST_BASE["geo_key"]
+    for pos in out.index[unmatched]:
+        vid = out.at[pos, "visita_id"]
+        point = v_geo.get(vid)
+        if not point:
+            continue
+        info["candidatas"] += 1
+        ranked = sorted((haversine_m(point, g), i) for i, g in e_geo)
+        d0, i0 = ranked[0]
+        if d0 > max_m:
+            info["rechazadas_lejos"] += 1
+            continue
+        d1 = ranked[1][0] if len(ranked) > 1 else float("inf")
+        if d1 - d0 < margin_m:
+            info["rechazadas_ambiguas"] += 1
+            continue
+        if not barrio_ok(v_barrio.get(vid, ""), e_barrio[i0]):
+            continue
+        v_is_gc = v_fuente.get(vid) == "geocode"
+        if v_is_gc and e_gc[i0]:
+            # Both coordinates derive from the addresses themselves — this
+            # would be a text match wearing a geo costume. The text tiers
+            # already refused it with better guards; respect that.
+            info["rechazadas_circular"] += 1
+            continue
+        # A measured coordinate earns a little more confidence than a typed
+        # one; a geocoded side pays a discount for its derived nature.
+        trust = base + (0.04 if v_fuente.get(vid) == "exif" else -0.02)
+        if v_is_gc or e_gc[i0]:
+            trust -= 0.05
+        trust = round(min(max(trust, 0.05), 0.99), 2)
+        if trust < TRUST_MIN:
+            # This tier runs AFTER the reliability cutoff, so it must enforce
+            # the cutoff itself — a sub-threshold match must never be published.
+            info["rechazadas_trust"] += 1
+            continue
+        out.at[pos, "sitio_id"] = e_sids[i0]
+        out.at[pos, "match_method"] = "geo_key"
+        out.at[pos, "match_score"] = round(d0, 1)
+        if "trust" in out.columns:
+            out.at[pos, "trust"] = trust
+        info["added"] += 1
+
+    print(f"geo_key (último recurso): +{info['added']} matches · "
+          f"{info['candidatas']} candidatas · {info['rechazadas_ambiguas']} descartadas "
+          f"por ambigüedad · {info['rechazadas_lejos']} por distancia · "
+          f"{info['rechazadas_circular']} circulares · {info['rechazadas_trust']} bajo trust")
+    return out, info

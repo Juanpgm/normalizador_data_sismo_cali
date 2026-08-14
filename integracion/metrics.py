@@ -19,7 +19,8 @@ def coords_coverage(df) -> dict:
             "pct": round(100 * parseable / max(len(df), 1), 1)}
 
 
-def match_metrics(match_table, df_edan, df_visitas, bridge_info=None) -> dict:
+def match_metrics(match_table, df_edan, df_visitas, bridge_info=None,
+                  exif_info=None, geo_key_info=None, geocode_info=None) -> dict:
     matched = match_table["sitio_id"].notna()
     by_method = match_table.loc[matched, "match_method"].value_counts().to_dict()
     m = {
@@ -42,6 +43,17 @@ def match_metrics(match_table, df_edan, df_visitas, bridge_info=None) -> dict:
         m["spatial_bridge"] = {k: bridge_info[k] for k in
                                ("mode", "n_parcels", "edan_with_parcel",
                                 "visitas_with_parcel", "added") if k in bridge_info}
+    if exif_info:
+        m["coords_exif"] = dict(exif_info)
+    if geocode_info:
+        m["geocode"] = dict(geocode_info)
+    if geo_key_info:
+        m["geo_key"] = dict(geo_key_info)
+    if "coords_fuente" in df_visitas.columns:
+        m["coords_visitas_por_fuente"] = {
+            str(k): int(v) for k, v in
+            df_visitas["coords_fuente"].astype(str).replace("", "ninguna")
+            .value_counts().items()}
     return m
 
 
@@ -50,7 +62,7 @@ def integrado_metrics(df_integrado) -> dict:
         "registros": int(len(df_integrado)),
         "columnas": int(df_integrado.shape[1]),
         "por_fuente": {k: int(v) for k, v in df_integrado["fuente"].value_counts().items()},
-        "coords_estandarizadas": int(df_integrado["lat"].notna().sum()),
+        "coords_estandarizadas": int(sum(1 for x in df_integrado["coords"] if parse_latlon(x))),
         "trust_score": {
             "mean": round(float(df_integrado["trust_score"].mean()), 3),
             "min": round(float(df_integrado["trust_score"].min()), 3),
@@ -59,9 +71,11 @@ def integrado_metrics(df_integrado) -> dict:
     }
 
 
-def build_report(match_table, df_edan, df_visitas, df_integrado, bridge_info=None) -> dict:
+def build_report(match_table, df_edan, df_visitas, df_integrado, bridge_info=None,
+                 exif_info=None, geo_key_info=None, geocode_info=None) -> dict:
     return {
-        "matching": match_metrics(match_table, df_edan, df_visitas, bridge_info),
+        "matching": match_metrics(match_table, df_edan, df_visitas, bridge_info,
+                                  exif_info, geo_key_info, geocode_info),
         "integracion": integrado_metrics(df_integrado),
     }
 
@@ -98,10 +112,24 @@ def print_report(report: dict) -> None:
           f"({mt['coords_edan']['pct']}%)")
     print(f"Coords WGS84 Visitas : {mt['coords_visitas']['con_coords_wgs84']}/{mt['coords_visitas']['total']} "
           f"({mt['coords_visitas']['pct']}%)")
+    if "coords_exif" in mt:
+        ex = mt["coords_exif"]
+        print(f"Coords desde EXIF    : {ex['visitas_con_gps']} visitas · "
+              f"{ex['fotos_gps_usadas']} fotos · dispersión mediana "
+              f"{ex['dispersion_mediana_m']} m · {ex['omitidas_por_confiables']} omitidas")
+    if "geocode" in mt:
+        ge = mt["geocode"]
+        print(f"Geocodificación      : {ge['cache_hits']} de cache · "
+              f"{ge['llamadas_api']} llamadas API · +{ge['aceptadas_nuevas']} "
+              f"aceptadas · {ge['rechazadas_nuevas']} rechazadas")
     if "spatial_bridge" in mt:
         sb = mt["spatial_bridge"]
         print(f"Puente espacial      : modo={sb['mode']} · +{sb['added']} matches · "
               f"{sb['n_parcels']} predios")
+    if "geo_key" in mt:
+        gk = mt["geo_key"]
+        print(f"Llave por coordenada : +{gk['added']} matches · "
+              f"{gk['rechazadas_ambiguas']} rechazadas por ambigüedad")
     print("\nMatches por método:")
     for k, v in sorted(mt["por_metodo"].items(), key=lambda x: -x[1]):
         print(f"  {k:16s} {v}")

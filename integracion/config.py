@@ -1,10 +1,23 @@
 """Central configuration: data sources, paths and tunable thresholds."""
 from __future__ import annotations
 
+from datetime import timedelta, timezone
 from pathlib import Path
+
+# ── Timezone ──────────────────────────────────────────────────────────────────
+# Colombia is UTC-5 year-round (no DST), so a fixed offset is exact. All
+# human-facing timestamps (job banner, log lines, stats sheet, run history)
+# display Bogotá time; runs.jsonl keeps the UTC twin for cross-system audits.
+BOGOTA_TZ = timezone(timedelta(hours=-5), "America/Bogota")
 
 # ── Repo layout ───────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
+
+# Local secrets (.env is gitignored). Loaded here because every entrypoint
+# imports config; real environment variables always take precedence.
+from .envfile import load_env_file  # noqa: E402
+
+load_env_file(ROOT / ".env")
 SERVICE_ACCOUNT_FILE = str(ROOT / "service_account.json")
 DATA_DIR = ROOT / "data"
 CATASTRO_DIR = DATA_DIR / "catastro"
@@ -52,11 +65,52 @@ EMBEDDING_MIN_SIM = 0.75   # tier 8: LM cosine floor
 SPATIAL_CLUSTER_EPS_M = 22.0
 SPATIAL_BRIDGE_MAX_M = 35.0   # safety cap for a parcel/cluster match
 
+# ── EXIF coordinates from the evidence photos ─────────────────────────────────
+# A visita links several photos; their GPS points cluster on the site. Measured
+# on the real data: dispersion to the centroid is 14 m median, 45 m p90, 66 m
+# max. The cut sits above that spread so normal scatter survives and the stray
+# photo (taken elsewhere and uploaded with the rest) is dropped.
+EXIF_OUTLIER_M = 75.0
+DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+
+# ── Geocoding (Google Maps) ───────────────────────────────────────────────────
+# Fills `coords` ONLY where empty, from the normalized address. Precision over
+# coverage: ROOFTOP is the parcel itself, RANGE_INTERPOLATED is a block-level
+# interpolation; GEOMETRIC_CENTER (street/neighbourhood centre) is rejected —
+# a coordinate hundreds of metres off poisons the geographic tiers.
+# The values are the nominal precision (metres) recorded per accepted result.
+GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+GEOCODE_API_KEY_ENV = "GOOGLE_MAPS_API_KEY"
+GEOCODE_ACCEPTED = {"ROOFTOP": 15.0, "RANGE_INTERPOLATED": 40.0}
+# Cache location candidates, in priority order: explicit env var, the Railway
+# volume (survives the container), the repo itself (committed, seeds Railway).
+GEOCODE_CACHE_ENV = "GEOCODE_CACHE_DIR"
+GEOCODE_VOLUME_DIR = "/data/geocode"
+GEOCODE_REPO_DIR = DATA_DIR / "geocode"
+
+# ── Geo key (last-resort tier) ────────────────────────────────────────────────
+# Runs only on visitas that survived the whole cascade AND the trust cutoff with
+# no match. The coordinate becomes the key by itself, so the guard is not just
+# proximity: the nearest EDAN site must also be UNAMBIGUOUS — the runner-up has
+# to be clearly farther away. Two sites equally close means the coordinate does
+# not identify anything, and we would rather leave the visita unmatched.
+#
+# The radius matches GEO_FAR_M rather than being tuned upward until matches
+# appear: 80 m is proximity this project already sanctions, and the two extra
+# guards here (ambiguity margin, barrio) are stricter than the geo tier's.
+#
+# Expect little from it. Measured 2026-08-14, it adds ~3 matches, because EDAN
+# only carries a coordinate for 9,4% of its sites — the ceiling is EDAN's
+# coordinate coverage, not the threshold. It pays off as that coverage grows.
+GEO_KEY_MAX_M = 80.0      # nearest EDAN site must be within this radius
+GEO_KEY_MARGIN_M = 25.0   # ...and the 2nd nearest at least this much farther
+
 # ── Trust ─────────────────────────────────────────────────────────────────────
 TRUST_MIN = 0.70           # reliability cutoff: matches below this are rejected
 
 # ── Trust base per method (higher = more deterministic evidence) ──────────────
 METHOD_TRUST_BASE = {
+    "preregistro": 0.97,      # the visita carries the EDAN consecutive id itself
     "handshake": 0.95,
     "vector": 0.93,
     "spatial_bridge": 0.90,   # cadastral parcel identity — very strong
@@ -66,4 +120,5 @@ METHOD_TRUST_BASE = {
     "tfidf": 0.75,
     "embedding": 0.72,
     "fuzzy": 0.70,
+    "geo_key": 0.74,          # coordinate alone, last resort — deliberately low
 }

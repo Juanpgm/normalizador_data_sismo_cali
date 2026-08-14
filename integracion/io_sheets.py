@@ -70,13 +70,46 @@ def _reuse_or_generate_ids(df, id_col, seed):
     return df
 
 
+def recover_barrio_header(df: pd.DataFrame) -> pd.DataFrame:
+    """Restore the EDAN "Barrio" header when the live sheet loses it.
+
+    Seen in production on 2026-08-14: someone editing the document replaced the
+    header with "-", the rename map stopped firing, and every run died on a
+    missing `barrio_vereda`. That column is the precision guard of the whole
+    cascade, so the pipeline cannot simply continue without it.
+
+    Recovery is deliberately narrow — the column must be unnamed AND sit in its
+    exact place between "Zona" and "Tipo" — and it announces itself, because a
+    sheet quietly losing headers is something a human has to go fix.
+    """
+    if "Barrio" in df.columns:
+        return df
+    cols = list(df.columns)
+    try:
+        left, right = cols.index("Zona"), cols.index("Tipo")
+    except ValueError:
+        return df
+    if right - left != 2 or str(cols[left + 1]).strip() not in ("", "-"):
+        return df
+    print(f"[sheets] AVISO: la columna de barrio llegó sin encabezado "
+          f"({cols[left + 1]!r}); se recupera por posición entre 'Zona' y 'Tipo'. "
+          f"Conviene restaurar el encabezado en la hoja.")
+    cols[left + 1] = "Barrio"
+    df.columns = cols
+    return df
+
+
 # ── EDAN ──────────────────────────────────────────────────────────────────────
 def load_edan() -> pd.DataFrame:
-    df = _read_values(EDAN_SPREADSHEET_ID, EDAN_SHEET_NAME)
+    df = recover_barrio_header(_read_values(EDAN_SPREADSHEET_ID, EDAN_SHEET_NAME))
 
     df = df.drop(columns=["DESCRIPCION CENTRALIZADA", "REFERENCIADO EN EL MAPA",
-                          "ID", "Direccion", "Color semaforo"], errors="ignore")
+                          "Direccion", "Color semaforo"], errors="ignore")
     df = df.rename(columns={
+        # The sheet's running number is the consecutive GRED hands to responders.
+        # Volunteers copy it into the visit form, which makes it a deterministic
+        # join key — see the `preregistro` tier in matching.py.
+        "ID": "consecutivo_edan",
         "Prioridad": "prioridad", "Estado": "estado",
         "Comuna - Corregimiento": "comuna_corregimiento", "Zona": "zona",
         "Barrio": "barrio_vereda", "Tipo": "tipo_estructura",
@@ -102,7 +135,9 @@ def load_edan() -> pd.DataFrame:
 
     # Drop ANULADO and fully-empty rows
     empty_values = {"", "-", " "}
-    cols_check = [c for c in df.columns if c != "sitio_id"]
+    # A row carrying nothing but its running number is still an empty row, so
+    # consecutivo_edan is excluded from the emptiness check alongside sitio_id.
+    cols_check = [c for c in df.columns if c not in ("sitio_id", "consecutivo_edan")]
     anulados = df["estado"].astype(str).str.upper() == "ANULADO"
     sin_datos = df[cols_check].apply(
         lambda row: all(str(v).strip() in empty_values for v in row), axis=1)
@@ -174,6 +209,13 @@ def load_visitas() -> pd.DataFrame:
             df[c] = df[c].astype(str).str.title()
 
     df = _reuse_or_generate_ids(df, "visita_id", VISITAS_ID_SEED)
+
+    # evidencia_soporte is a comma-separated list of Drive links, not a single
+    # value. The count makes it filterable in the published sheet without
+    # anyone having to parse the URLs.
+    if "evidencia_soporte" in df.columns:
+        from .exif_coords import extract_file_ids
+        df["n_evidencias"] = df["evidencia_soporte"].map(lambda c: len(extract_file_ids(c)))
 
     df.insert(df.columns.get_loc("direccion") + 1, "direccion_norm",
               df["direccion"].apply(normalize_address))

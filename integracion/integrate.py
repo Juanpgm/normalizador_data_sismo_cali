@@ -62,14 +62,67 @@ def build_integrado(df_master) -> pd.DataFrame:
         if ce in df.columns and cv in df.columns:
             df.insert(pos, name, _coalesce(ce, cv))
 
-    # Coordinates → WGS84 decimal
-    _pts_e = df["coords_edan"].map(parse_latlon) if "coords_edan" in df else pd.Series([None] * len(df), index=df.index)
-    _pts_v = df["coords_visita"].map(parse_latlon) if "coords_visita" in df else pd.Series([None] * len(df), index=df.index)
-    _pts = _pts_e.where(_pts_e.notna(), _pts_v)
-    df.insert(4, "lat", _pts.map(lambda p: round(p[0], 6) if p else np.nan))
-    df.insert(5, "lon", _pts.map(lambda p: round(p[1], 6) if p else np.nan))
-    df.insert(6, "coords_unificadas",
-              _pts.map(lambda p: f"{p[0]:.6f}, {p[1]:.6f}" if p else None))
+    # ONE coordinate per record, always the most trustworthy one available.
+    # Ranking: exif (instrument) > EDAN typed > visita typed > EDAN geocoded >
+    # visita geocoded. Measured and typed values are independent data; a
+    # geocoded one merely derives from the address already in the table.
+    # `coords_fuente` records which source won, so every row stays auditable.
+    _empty = pd.Series([None] * len(df), index=df.index)
+    _pts_e = df["coords_edan"].map(parse_latlon) if "coords_edan" in df else _empty
+    _pts_v = df["coords_visita"].map(parse_latlon) if "coords_visita" in df else _empty
+
+    def _fuente_of(side_col, plain_ok, pts, typed_label):
+        """Provenance series for one side. The merge suffixes the column when
+        both tables carry it; a bare `coords_fuente` is historically the visita
+        one. Rows with a parseable point but no label default to 'typed'."""
+        if side_col in df:
+            s = df[side_col].astype(str)
+        elif plain_ok and "coords_fuente" in df:
+            s = df["coords_fuente"].astype(str)
+        else:
+            s = pd.Series("", index=df.index)
+        s = s.where(~s.isin(["nan", "None"]), "")
+        return s.mask(s.eq("") & pts.notna(), typed_label)
+
+    _fe = _fuente_of("coords_fuente_edan", False, _pts_e, "edan")
+    _fv = _fuente_of("coords_fuente_visita", True, _pts_v, "visita")
+    _prec_e = pd.to_numeric(
+        df.get("coords_precision_m_edan", _empty), errors="coerce")
+    _prec_v = pd.to_numeric(
+        df.get("coords_precision_m_visita", df.get("coords_precision_m", _empty)),
+        errors="coerce")
+
+    _c_exif = _pts_v.notna() & _fv.eq("exif")
+    _c_edan = _pts_e.notna() & _fe.eq("edan")
+    _c_vis = _pts_v.notna() & _fv.eq("visita")
+    _c_gc_e = _pts_e.notna() & _fe.eq("geocode")
+    _c_gc_v = _pts_v.notna() & _fv.eq("geocode")
+
+    _pts = _pts_v.where(_c_exif,
+           _pts_e.where(_c_edan,
+           _pts_v.where(_c_vis,
+           _pts_e.where(_c_gc_e,
+           _pts_v.where(_c_gc_v)))))
+    _conds = [_c_exif, _c_edan, _c_vis, _c_gc_e, _c_gc_v]
+    _fuente = np.select(_conds, ["exif", "edan", "visita", "geocode", "geocode"],
+                        default="")
+    _precision = np.select(
+        _conds,
+        [_prec_v, _prec_e, _prec_v, _prec_e, _prec_v], default=np.nan)
+
+    # The raw per-source columns are consumed here; drop them before inserting
+    # the unified ones so the names are free and no second coordinate survives.
+    df = df.drop(columns=["coords_fuente", "coords_precision_m",
+                          "coords_fuente_edan", "coords_fuente_visita",
+                          "coords_precision_m_edan", "coords_precision_m_visita"],
+                 errors="ignore")
+
+    # isinstance, not truthiness: the .where chain fills losers with NaN, and
+    # NaN is truthy — `if p` would happily subscript a float.
+    df.insert(4, "coords", _pts.map(
+        lambda p: f"{p[0]:.6f}, {p[1]:.6f}" if isinstance(p, tuple) else None))
+    df.insert(5, "coords_fuente", _fuente)
+    df.insert(6, "coords_precision_m", pd.Series(_precision, index=df.index))
 
     def _as_num(col):
         s = df[col].astype(str).str.strip().str.replace(",", "", regex=False)
@@ -85,7 +138,7 @@ def build_integrado(df_master) -> pd.DataFrame:
         addr = canonicalize_for_match(row["direccion_unificada"])
         if addr and address_to_vector(addr)[0] != 0:
             t += 0.10
-        if row.get("coords_unificadas"):
+        if row.get("coords"):
             t += 0.10
         if str(row.get("barrio_unificado")).strip() not in {"", "-", "nan", "None"}:
             t += 0.05
@@ -109,14 +162,15 @@ def build_consolidada(df_integrado) -> pd.DataFrame:
     integrated record (edan+visita | solo_edan | solo_visita)."""
     keep = [
         "fuente", "trust_score", "match_method",
-        "sitio_id", "visita_id",
+        "sitio_id", "visita_id", "consecutivo_edan",
         "direccion_unificada", "barrio_unificado", "comuna_unificada",
-        "lat", "lon", "coords_unificadas",
+        "coords", "coords_fuente", "coords_precision_m",
         "tipo_estructura_edan", "tipo_estructura_visita",
         "nombre_estructura", "punto_referencia",
         "nivel_riesgo", "estado", "estado_estructura", "requiere_demolicion",
         "n_fallecidos_total", "n_atrapamientos_total", "n_rescatados_total",
         "descripcion_edan", "descripcion_visita",
+        "n_evidencias", "evidencia_soporte",
     ]
     cols = [c for c in keep if c in df_integrado.columns]
     out = df_integrado[cols].copy()

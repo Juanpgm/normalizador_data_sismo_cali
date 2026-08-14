@@ -5,6 +5,7 @@ Examples:
   python run_integration.py                 # full run, uses cache if present
   python run_integration.py --fresh         # ignore cache, re-read Google Sheets
   python run_integration.py --no-embedding  # skip the LM tier (faster)
+  python run_integration.py --no-exif       # skip the evidence-photo GPS harvest
 
   # what the hourly job runs: fresh data, no Excel, published to Google Sheets
   python run_integration.py --fresh --no-export --to-sheets
@@ -35,21 +36,16 @@ def main():
                     help="publish the integrated table and stats to Google Sheets")
     ap.add_argument("--fetch-parcels", action="store_true",
                     help="try to download a Cali parcel layer first (enables parcel mode)")
-    ap.add_argument("--exif-coords", action="store_true",
-                    help="harvest GPS from evidence photos (Drive) to fill missing visita coords")
+    ap.add_argument("--no-exif", action="store_true",
+                    help="skip harvesting GPS from the evidence photos (Drive)")
+    ap.add_argument("--no-geocode", action="store_true",
+                    help="skip geocoding addresses that lack coordinates")
+    ap.add_argument("--geocode-limit", type=int, default=None, metavar="N",
+                    help="cap Geocoding API calls this run (smoke test before full spend)")
+    ap.add_argument("--no-geo-key", action="store_true",
+                    help="skip the last-resort coordinate-only tier")
     args = ap.parse_args()
     started_at = datetime.now(timezone.utc)
-
-    if args.exif_coords:
-        import pickle
-        from integracion.exif_coords import apply_to_visitas, harvest_via_drive
-        from integracion.pipeline import _CACHE, load_data
-        df_edan, df_visitas = load_data(use_cache=not args.fresh)
-        harvested = harvest_via_drive(df_visitas)
-        df_visitas = apply_to_visitas(df_visitas, harvested)
-        _CACHE.mkdir(parents=True, exist_ok=True)
-        with open(_CACHE / "df_visitas.pkl", "wb") as f:
-            pickle.dump(df_visitas, f)   # re-cache so the run below uses new coords
 
     if args.fetch_parcels:
         from integracion.catastro_fetch import fetch_parcels
@@ -59,6 +55,10 @@ def main():
         use_cache=not args.fresh,
         with_embedding=not args.no_embedding,
         with_bridge=not args.no_bridge,
+        with_exif=not args.no_exif,
+        with_geocode=not args.no_geocode,
+        geocode_limit=args.geocode_limit,
+        with_geo_key=not args.no_geo_key,
         export=not args.no_export,
     )
     metrics.print_report(artifacts["report"])

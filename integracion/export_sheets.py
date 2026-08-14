@@ -20,21 +20,20 @@ paranoid. Its contract:
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import gspread
 import pandas as pd
 
 from . import __version__, metrics
-from .config import (BLOCK_PLACA_TOL, EMBEDDING_MIN_SIM, FUZZY_MIN_LEN,
-                     FUZZY_THRESHOLD, GEO_FAR_M, GEO_NEAR_M, METHOD_TRUST_BASE,
-                     SPATIAL_BRIDGE_MAX_M, SPATIAL_CLUSTER_EPS_M, STATS_SHEET_ID,
-                     STATS_SHEET_NAME, TABLA_SHEET_ID, TABLA_SHEET_NAME,
-                     TARGET_SPREADSHEET_ID, TFIDF_MIN, TRUST_MIN, VECTOR_TOL,
-                     WRITE_SCOPES)
+from .config import (BLOCK_PLACA_TOL, BOGOTA_TZ, EMBEDDING_MIN_SIM,
+                     FUZZY_MIN_LEN, FUZZY_THRESHOLD, GEO_FAR_M, GEO_NEAR_M,
+                     METHOD_TRUST_BASE, SPATIAL_BRIDGE_MAX_M,
+                     SPATIAL_CLUSTER_EPS_M, STATS_SHEET_ID, STATS_SHEET_NAME,
+                     TABLA_SHEET_ID, TABLA_SHEET_NAME, TARGET_SPREADSHEET_ID,
+                     TFIDF_MIN, TRUST_MIN, VECTOR_TOL, WRITE_SCOPES)
 from .gauth import credentials
 
-BOGOTA = timezone(timedelta(hours=-5))
 STATS_HEADER = ["seccion", "metrica", "valor"]
 MAX_CELL_CHARS = 50_000      # hard Sheets limit per cell
 MAX_REQUEST_CHARS = 1_500_000  # stay comfortably under the API payload cap
@@ -169,8 +168,8 @@ def run_info(started_at: datetime, *, with_embedding: bool,
     """Provenance block: when this ran, from where, and with which switches."""
     now = datetime.now(timezone.utc)
     return {
+        "timestamp_bogota": now.astimezone(BOGOTA_TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "timestamp_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "timestamp_bogota": now.astimezone(BOGOTA).strftime("%Y-%m-%d %H:%M:%S"),
         "duracion_seg": round((now - started_at).total_seconds(), 1),
         "origen": detect_origin(),
         "git_sha": detect_commit(),
