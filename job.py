@@ -23,6 +23,27 @@ from integracion.gauth import service_account_email
 from integracion.pipeline import run
 
 
+def _print_history(log_dir, limit: int = 8) -> None:
+    """Echo the recent run history into this execution's log.
+
+    A cron container only exists while it runs, so there is no shell to read
+    the volume from between executions. Printing the tail here is what makes
+    runs.jsonl visible from the platform log viewer.
+    """
+    history = runlog.read_runs(log_dir, limit=limit)
+    if not history:
+        return
+    print(f"\nÚltimas {len(history)} corridas:")
+    for row in history:
+        estado = row.get("estado", "?")
+        detail = (f"{row.get('registros_publicados', '?')} registros · "
+                  f"{row.get('tasa_match_pct', '?')}% match"
+                  if estado == "ok" else row.get("error", ""))
+        print(f"  {row.get('timestamp_utc', '?')}  {estado:5s}  "
+              f"{row.get('duracion_seg', '?')}s  {detail}")
+    print()
+
+
 def main() -> int:
     started_at = datetime.now(timezone.utc)
     log_dir = runlog.resolve_log_dir()
@@ -35,6 +56,8 @@ def main() -> int:
         print(f"Service account: {service_account_email()}")
     except Exception as exc:                     # credential problems surface below
         print(f"Service account: no se pudo leer ({exc})")
+
+    _print_history(log_dir)
 
     try:
         artifacts = run(use_cache=False, with_embedding=True, with_bridge=True,
