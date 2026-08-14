@@ -1,0 +1,46 @@
+name: Hourly integration
+
+on:
+  schedule:
+    # Every hour on the hour (UTC). GitHub's scheduler is best-effort and can
+    # drift several minutes under load.
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+# Never let a slow run race a new one against the same worksheets.
+concurrency:
+  group: hourly-integration
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # The LM tier downloads a static embedding model on first use; caching it
+      # keeps the hourly run to the pipeline itself.
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-potion-multilingual-128M-v1
+
+      - name: Run integration and publish to Google Sheets
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python run_integration.py --fresh --no-export --to-sheets
