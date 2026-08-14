@@ -52,20 +52,55 @@ pytest -q
 `--fresh` no es opcional para publicar: sin ese flag el pipeline lee los pickles
 de `output/cache/` y republicaría datos viejos.
 
-## Automatización
+## Automatización — Railway
 
-`.github/workflows/hourly.yml` corre el pipeline cada hora (`cron: "0 * * * *"`)
-y publica el resultado. La credencial vive en el secret
-`GOOGLE_SERVICE_ACCOUNT_JSON` del repositorio:
+El job corre **cada hora en Railway** (proyecto `normalizador-sismo-cali`,
+servicio `normalizador`). La configuración está versionada en `railway.json`:
 
-```bash
-gh secret set GOOGLE_SERVICE_ACCOUNT_JSON --repo Juanpgm/normalizador_data_sismo_cali < service_account.json
+```json
+"deploy": { "cronSchedule": "0 * * * *", "restartPolicyType": "NEVER" }
 ```
 
-Dos cosas para tener presentes del scheduler de GitHub: el cron es *best-effort*
-y puede demorarse algunos minutos, y GitHub **desactiva los workflows agendados
-tras 60 días sin actividad en el repositorio** — si el proyecto queda quieto, hay
-que reactivarlo desde la pestaña Actions.
+`job.py` es el entrypoint del scheduler: sin argumentos, siempre datos frescos,
+sin Excel, y **sale con código distinto de cero si falla** para que la corrida
+quede marcada como fallida. El contenedor debe terminar rápido — Railway
+**saltea** una ejecución si la anterior sigue corriendo.
+
+```bash
+railway logs                     # logs de la última ejecución
+railway variable list            # variables del servicio
+railway up                       # redesplegar tras un cambio
+```
+
+### Secrets
+
+`GOOGLE_SERVICE_ACCOUNT_JSON` está cargado como variable del servicio. Nunca
+entra a la imagen: `.dockerignore` excluye el archivo de credenciales de todas
+las capas.
+
+```bash
+railway variable set GOOGLE_SERVICE_ACCOUNT_JSON --stdin < service_account.json
+```
+
+### Logs
+
+Los logs de Railway tienen ventana de retención y no tienen estructura, así que
+el job guarda su propia copia en un volumen montado en `/data`:
+
+| Archivo | Contenido |
+|---|---|
+| `/data/logs/integracion.log` | Todo lo que imprimió la corrida, con timestamp por línea. Rota a los 5 MB, guarda 5 archivos. |
+| `/data/logs/runs.jsonl` | Una línea JSON por ejecución: estado, duración, registros publicados, matches, tasa. |
+
+Si el volumen no está montado, el job sigue corriendo con stdout solamente —
+loguear nunca es motivo para fallar una corrida.
+
+### GitHub Actions
+
+`.github/workflows/ci.yml` corre los tests en cada push.
+`.github/workflows/hourly.yml` quedó **solo como disparo manual**: si tuviera
+cron, Railway y GitHub publicarían en las mismas dos hojas cada hora y se
+pisarían. Un solo scheduler a la vez.
 
 ## Datos personales
 

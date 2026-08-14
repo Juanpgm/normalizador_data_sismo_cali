@@ -1,10 +1,12 @@
-name: Hourly integration
+# Manual fallback only. The hourly schedule runs on Railway (see railway.json).
+#
+# The cron trigger is deliberately absent: if it were enabled, Railway and
+# GitHub would both publish to the same two worksheets every hour and race each
+# other. Keep exactly one scheduler. If you ever move the schedule back here,
+# remove `cronSchedule` from railway.json in the same commit.
+name: Integration (manual)
 
 on:
-  schedule:
-    # Every hour on the hour (UTC). GitHub's scheduler is best-effort and can
-    # drift several minutes under load.
-    - cron: "0 * * * *"
   workflow_dispatch:
 
 # Never let a slow run race a new one against the same worksheets.
