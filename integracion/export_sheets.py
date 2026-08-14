@@ -143,6 +143,27 @@ def build_stats_values(report: dict, match_table: pd.DataFrame | None = None,
     return rows
 
 
+def detect_origin() -> str:
+    """Where this run is executing. The stats sheet is the audit trail, so an
+    unrecognised environment says so instead of silently claiming 'local'."""
+    if os.environ.get("RAILWAY_SERVICE_NAME"):
+        return f"railway:{os.environ['RAILWAY_SERVICE_NAME']}"
+    if os.environ.get("GITHUB_ACTIONS"):
+        return "github-actions"
+    if os.path.exists("/.dockerenv"):
+        return "container"
+    return "local"
+
+
+def detect_commit() -> str:
+    """Short commit of the deployed code, when the platform exposes one."""
+    for var in ("RAILWAY_GIT_COMMIT_SHA", "GITHUB_SHA"):
+        sha = os.environ.get(var, "").strip()
+        if sha:
+            return sha[:8]
+    return ""
+
+
 def run_info(started_at: datetime, *, with_embedding: bool,
              bridge_info: dict | None = None) -> dict:
     """Provenance block: when this ran, from where, and with which switches."""
@@ -151,8 +172,8 @@ def run_info(started_at: datetime, *, with_embedding: bool,
         "timestamp_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
         "timestamp_bogota": now.astimezone(BOGOTA).strftime("%Y-%m-%d %H:%M:%S"),
         "duracion_seg": round((now - started_at).total_seconds(), 1),
-        "origen": "github-actions" if os.environ.get("GITHUB_ACTIONS") else "local",
-        "git_sha": os.environ.get("GITHUB_SHA", "")[:8],
+        "origen": detect_origin(),
+        "git_sha": detect_commit(),
         "embedding_activo": with_embedding,
         "bridge_modo": (bridge_info or {}).get("mode", "n/a"),
         "version": __version__,

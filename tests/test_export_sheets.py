@@ -314,6 +314,33 @@ def test_stats_break_trust_down_by_method(client, sheets, df_consolidada,
     assert {"handshake.n", "handshake.media", "handshake.min"} <= per_method
 
 
+# ── Provenance ────────────────────────────────────────────────────────────────
+def test_origin_identifies_the_platform(monkeypatch):
+    for var in ("RAILWAY_SERVICE_NAME", "GITHUB_ACTIONS"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(export_sheets.os.path, "exists", lambda p: False)
+    assert export_sheets.detect_origin() == "local"
+
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert export_sheets.detect_origin() == "github-actions"
+
+    monkeypatch.setenv("RAILWAY_SERVICE_NAME", "normalizador")
+    assert export_sheets.detect_origin() == "railway:normalizador"
+
+
+def test_commit_prefers_the_platform_that_deployed(monkeypatch):
+    monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
+    monkeypatch.setenv("GITHUB_SHA", "abcdef1234567890")
+    assert export_sheets.detect_commit() == "abcdef12"
+
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "0123456789abcdef")
+    assert export_sheets.detect_commit() == "01234567"
+
+    monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA")
+    monkeypatch.delenv("GITHUB_SHA")
+    assert export_sheets.detect_commit() == ""
+
+
 # ── Chunking ──────────────────────────────────────────────────────────────────
 def test_large_payloads_are_split_into_sequential_top_down_writes():
     values = [[f"row-{i}", "x" * 200] for i in range(100)]
