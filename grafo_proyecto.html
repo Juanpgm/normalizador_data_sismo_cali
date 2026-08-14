@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grafo 3D · Integración sismo Cali</title>
+<style>
+  :root{
+    --bg:#080b11; --panel:#12181f; --panel2:#1a222c; --border:#2a3441;
+    --txt:#e6edf3; --muted:#8b949e; --accent:#58a6ff;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#0b0f16; --panel:#12181f; --panel2:#1a222c; --border:#2a3441;
+           --txt:#e6edf3; --muted:#8b949e; --accent:#58a6ff; }
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  #wrap{display:flex;height:100vh;width:100vw}
+  #graph{flex:1;position:relative;
+    background:radial-gradient(120% 120% at 50% 30%, #131c28 0%, #0a0e15 55%, #05070b 100%)}
+  canvas{display:block;width:100%;height:100%;cursor:grab}
+  canvas.grabbing{cursor:grabbing}
+  aside{width:340px;min-width:340px;background:var(--panel);border-left:1px solid var(--border);
+    padding:20px;overflow-y:auto}
+  h1{font-size:16px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:12px;margin-bottom:16px}
+  .kpis{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px}
+  .kpi{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px}
+  .kpi b{font-size:20px;display:block}
+  .kpi span{font-size:11px;color:var(--muted)}
+  .legend{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;font-size:12px}
+  .legend div{display:flex;align-items:center;gap:6px}
+  .dot{width:11px;height:11px;border-radius:50%}
+  #detail{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:14px;min-height:120px}
+  #detail h2{font-size:14px;margin:0 0 2px}
+  #detail .role{color:var(--muted);font-size:12px;margin-bottom:10px}
+  #detail ul{margin:6px 0 0;padding-left:16px;font-size:12px}
+  #detail code{background:var(--bg);padding:1px 5px;border-radius:4px;font-size:11px}
+  .pill{display:inline-block;font-size:10px;padding:1px 7px;border-radius:20px;border:1px solid var(--border);color:var(--muted);margin-right:4px}
+  .hint{font-size:11px;color:var(--muted);margin-top:14px;line-height:1.5}
+  #toolbar{position:absolute;top:14px;left:14px;z-index:5;display:flex;gap:6px;
+    background:rgba(18,24,31,.85);border:1px solid var(--border);border-radius:9px;padding:5px;backdrop-filter:blur(6px)}
+  #toolbar button{background:transparent;border:0;color:var(--muted);font-size:12px;
+    padding:6px 12px;border-radius:6px;cursor:pointer;font-weight:600}
+  #toolbar button.active{background:var(--accent);color:#fff}
+  #hud{position:absolute;bottom:12px;left:14px;z-index:5;font-size:11px;color:var(--muted);
+    background:rgba(18,24,31,.7);border:1px solid var(--border);border-radius:8px;padding:6px 10px}
+  #hud b{color:var(--txt)}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="graph">
+    <div id="toolbar">
+      <button id="btnMod" class="active">Módulos 3D</button>
+      <button id="btnFlow">Flujo de datos EDAN/Visitas</button>
+    </div>
+    <canvas id="cv"></canvas>
+    <div id="hud">Arrastrá para orbitar · rueda para zoom · clic en un nodo · doble clic para autorrotar</div>
+  </div>
+  <aside>
+    <h1>Integración EDAN ↔ Visitas</h1>
+    <div class="sub">Emergencia sismo Cali · grafo 3D de módulos y flujo</div>
+    <div class="kpis">
+      <div class="kpi"><b>653</b><span>visitas emparejadas (62.1%)</span></div>
+      <div class="kpi"><b>2 037</b><span>registros integrados</span></div>
+      <div class="kpi"><b>0.91</b><span>trust medio (corte 0.70)</span></div>
+      <div class="kpi"><b>34</b><span>tests en verde</span></div>
+    </div>
+    <div class="legend" id="legend"></div>
+    <div id="detail"></div>
+  </aside>
+</div>
+<script>
+const COLOR={found:'#f0883e',tier:'#3fb950',asm:'#a371f7',orch:'#58a6ff',exp:'#db61a2'};
+const LAYER={found:0,tier:1,asm:2,orch:3,exp:4};
+const nodes=[
+ {id:'config',g:'found',loc:58,role:'Umbrales, rutas e IDs de las hojas',funcs:['METHOD_TRUST_BASE','TRUST_MIN','CALI_BBOX']},
+ {id:'normalization',g:'found',loc:211,role:'Normalización IGAC + huella + vector 3D',funcs:['normalize_address','make_handshake','address_to_vector']},
+ {id:'coords',g:'found',loc:192,role:'Parseo de coordenadas a WGS84 (DMS, MAGNA-SIRGAS)',funcs:['parse_coords','coords_to_wgs84','parse_latlon','haversine_m']},
+ {id:'io_sheets',g:'tier',loc:197,role:'Lectura Google Sheets + limpieza + IDs (fix del bug de IDs)',funcs:['load_edan','load_visitas','_read_values','generar_ids']},
+ {id:'matching',g:'tier',loc:249,role:'Canonicalización, guards y cascada (niveles 1-7) + ordinales',funcs:['canonicalize_for_match','coherent','corner_key','build_match_table']},
+ {id:'spatial_bridge',g:'tier',loc:223,role:'Puente espacial: mismo predio / cúmulo (parcel/surrogate)',funcs:['assign_parcels','add_spatial_bridge_matches','discover_local_parcels']},
+ {id:'embedding',g:'tier',loc:153,role:'Nivel semántico LM (model2vec) con guard reforzado',funcs:['EmbeddingIndex','embedding_guard','interpret_address']},
+ {id:'trust',g:'tier',loc:75,role:'trust_score por match + corte de confiabilidad',funcs:['compute_trust']},
+ {id:'integrate',g:'asm',loc:125,role:'Merge externo + tabla integrada + subconjuntos',funcs:['build_master','build_integrado','build_consolidada']},
+ {id:'metrics',g:'asm',loc:103,role:'Métricas de cobertura y reporte de progreso',funcs:['match_metrics','build_report','print_report']},
+ {id:'pipeline',g:'orch',loc:200,role:'Orquestación end-to-end + export Excel',funcs:['run','load_data','export_excel']},
+ {id:'catastro_fetch',g:'orch',loc:154,role:'Descargador de predios ArcGIS (puente espacial)',funcs:['fetch_parcels','query_bbox']},
+ {id:'ml_reranker',g:'exp',loc:184,role:'Experimento ML: re-ranker (prueba del techo seguro)',funcs:['run_experiment','_features']},
+];
+const edges=[
+ ['coords','config'],['io_sheets','config'],['io_sheets','coords'],['io_sheets','normalization'],
+ ['matching','config'],['matching','coords'],['matching','normalization'],
+ ['spatial_bridge','config'],['spatial_bridge','coords'],['spatial_bridge','matching'],['spatial_bridge','normalization'],
+ ['embedding','config'],['embedding','matching'],['embedding','normalization'],
+ ['trust','config'],['trust','coords'],['trust','embedding'],
+ ['integrate','coords'],['integrate','matching'],['metrics','coords'],
+ ['pipeline','config'],['pipeline','coords'],['pipeline','embedding'],['pipeline','io_sheets'],['pipeline','matching'],['pipeline','spatial_bridge'],['pipeline','trust'],
+ ['catastro_fetch','config'],['catastro_fetch','coords'],['catastro_fetch','pipeline'],
+ ['ml_reranker','coords'],['ml_reranker','embedding'],['ml_reranker','matching'],['ml_reranker','pipeline'],
+];
+const byId=Object.fromEntries(nodes.map(n=>[n.id,n]));
+
+// ── Module 3D layout: one ring per layer, stacked along X ────────────────────
+(function layoutModules(){
+  const groups={};
+  nodes.forEach(n=>{(groups[n.g]=groups[n.g]||[]).push(n);});
+  for(const g in groups){
+    const arr=groups[g], R=70+arr.length*14, x=(LAYER[g]-2)*185;
+    arr.forEach((n,i)=>{const a=i/arr.length*Math.PI*2+LAYER[g]*0.5;
+      n.p={x, y:Math.sin(a)*R, z:Math.cos(a)*R};
+      n.r=7+Math.sqrt(n.loc)*1.05;});
+  }
+})();
+
+// ── Flow data (3D, keeps the EDAN/Visitas pipeline) ──────────────────────────
+const FK={source:'#f0883e',proc:'#3fb950',data:'#a371f7',cascade:'#58a6ff',output:'#db61a2'};
+const fnodes=[
+ {id:'sE',col:0,row:-1,kind:'source',t:'Google Sheet',s:'EDAN · Datos Madre'},
+ {id:'sV',col:0,row:1,kind:'source',t:'Google Sheet',s:'Visitas · Formulario'},
+ {id:'lE',col:1,row:-1,kind:'proc',t:'load_edan()',s:'limpieza · sitio_id'},
+ {id:'lV',col:1,row:1,kind:'proc',t:'load_visitas()',s:'limpieza · visita_id'},
+ {id:'std',col:2,row:0,kind:'proc',t:'Estandarización',s:'IGAC · huella · WGS84'},
+ {id:'dE',col:3,row:-1,kind:'data',t:'df_edan',s:'1 406 sitios'},
+ {id:'dV',col:3,row:1,kind:'data',t:'df_visitas',s:'1 051 visitas'},
+ {id:'cas',col:4,row:0,kind:'cascade',t:'Cascada de matching',s:'9 niveles · guards'},
+ {id:'tr',col:5,row:0,kind:'proc',t:'trust_score',s:'corte ≥ 0.70'},
+ {id:'int',col:6,row:0,kind:'proc',t:'Integración',s:'merge externo'},
+ {id:'xls',col:7,row:0,kind:'output',t:'Excel entregable',s:'consolidada · matches'},
+];
+const fmap=Object.fromEntries(fnodes.map(n=>[n.id,n]));
+fnodes.forEach(n=>{ n.p={ x:(n.col-3.5)*150, y:n.row*135, z:Math.sin(n.col*0.8)*70 };
+  n.r=13; n.kindColor=FK[n.kind]; });
+const fedges=[
+ ['sE','lE',''],['sV','lV',''],['lE','std',''],['lV','std',''],
+ ['std','dE','normaliza'],['std','dV','normaliza'],
+ ['dE','cas','1406 sitios'],['dV','cas','1051 visitas'],
+ ['cas','tr','match_table'],['tr','int','653 · trust≥0.70'],
+ ['dE','int','merge'],['dV','int','merge'],['int','xls','df_integrado · 2037'],
+];
+
+// ── 3D renderer (canvas, self-contained) ─────────────────────────────────────
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+let DPR=Math.min(window.devicePixelRatio||1,2), W=0,H=0;
+let yaw=0.6, pitch=-0.35, zoom=1, cx0=0, cy0=0;
+let mode='modules', autorot=true, sel=null;
+function resize(){ W=cv.clientWidth;H=cv.clientHeight;cv.width=W*DPR;cv.height=H*DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);cx0=W/2;cy0=H/2; }
+window.addEventListener('resize',resize);
+
+function project(p){
+  const cy=Math.cos(yaw),sy=Math.sin(yaw);
+  let x1=p.x*cy - p.z*sy, z1=p.x*sy + p.z*cy;
+  const cxp=Math.cos(pitch),sxp=Math.sin(pitch);
+  let y1=p.y*cxp - z1*sxp, z2=p.y*sxp + z1*cxp;
+  const focal=760*zoom, den=Math.max(focal - z2, 60), s=focal/den;
+  return {x:cx0+x1*s, y:cy0+y1*s, s, depth:z2};
+}
+function shade(hex,f){ const n=parseInt(hex.slice(1),16);
+  let r=(n>>16)&255,g=(n>>8)&255,b=n&255;
+  r=Math.round(r*f);g=Math.round(g*f);b=Math.round(b*f);
+  return `rgb(${r},${g},${b})`; }
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  const N = (mode==='modules')?nodes:fnodes;
+  const E = (mode==='modules')?edges:fedges;
+  const col = n => (mode==='modules')?COLOR[n.g]:n.kindColor;
+  // project all
+  const P={}; N.forEach(n=>P[n.id]=project(n.p));
+  // edges (sorted by depth, far first)
+  const eDrawn = E.map(e=>{const A=P[e[0]],B=P[e[1]];return {A,B,lbl:e[2]||'',d:(A.depth+B.depth)/2,c:col(byId[e[0]]||fmap[e[0]])};})
+                  .sort((a,b)=>a.d-b.d);
+  for(const e of eDrawn){
+    const on = sel && (P[sel.id]===e.A||P[sel.id]===e.B);
+    ctx.strokeStyle = on? e.c : 'rgba(140,160,185,'+(0.10+0.14*Math.max(0,(e.d+300)/600))+')';
+    ctx.lineWidth = on?2.2:1.1;
+    ctx.beginPath();ctx.moveTo(e.A.x,e.A.y);
+    if(mode==='flow'){const mx=(e.A.x+e.B.x)/2;ctx.bezierCurveTo(mx,e.A.y,mx,e.B.y,e.B.x,e.B.y);}
+    else ctx.lineTo(e.B.x,e.B.y);
+    ctx.stroke();
+    // arrowhead
+    const ang=Math.atan2(e.B.y-e.A.y,e.B.x-e.A.x), tx=e.B.x-Math.cos(ang)*((fmap[Object.keys(fmap).find(k=>P[k]===e.B)]?18:12)), ty=e.B.y-Math.sin(ang)*12;
+    ctx.fillStyle=on?e.c:'rgba(140,160,185,0.35)';
+    ctx.beginPath();ctx.moveTo(tx,ty);
+    ctx.lineTo(tx-Math.cos(ang-0.4)*7,ty-Math.sin(ang-0.4)*7);
+    ctx.lineTo(tx-Math.cos(ang+0.4)*7,ty-Math.sin(ang+0.4)*7);
+    ctx.closePath();ctx.fill();
+    if(e.lbl && e.d>-140){ ctx.font='600 '+Math.max(8,10*((e.A.s+e.B.s)/2))+'px system-ui';
+      ctx.fillStyle='rgba(200,210,225,0.75)';ctx.textAlign='center';
+      ctx.fillText(e.lbl,(e.A.x+e.B.x)/2,(e.A.y+e.B.y)/2-4); }
+  }
+  // nodes sorted far→near
+  const order=N.map(n=>({n,pr:P[n.id]})).sort((a,b)=>a.pr.depth-b.pr.depth);
+  for(const {n,pr} of order){
+    const c=col(n), isSel=sel===n;
+    if(mode==='modules'){
+      const r=Math.max(4,n.r*pr.s);
+      const gr=ctx.createRadialGradient(pr.x-r*0.3,pr.y-r*0.3,r*0.1,pr.x,pr.y,r*1.15);
+      gr.addColorStop(0,shade(c,1.35));gr.addColorStop(0.5,c);gr.addColorStop(1,shade(c,0.45));
+      ctx.beginPath();ctx.arc(pr.x,pr.y,r,0,7);
+      ctx.shadowColor=c;ctx.shadowBlur=isSel?26:12;ctx.fillStyle=gr;ctx.fill();ctx.shadowBlur=0;
+      if(isSel){ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();}
+      ctx.font=(isSel?'700 ':'600 ')+Math.max(9,12*pr.s)+'px system-ui';
+      ctx.fillStyle=isSel?'#fff':'rgba(230,237,243,0.9)';ctx.textAlign='center';
+      ctx.fillText(n.id,pr.x,pr.y+r+13*pr.s);
+    } else {
+      // billboard card
+      const w=(n.col===4?150:132)*pr.s, h=44*pr.s, x=pr.x-w/2,y=pr.y-h/2;
+      ctx.shadowColor=c;ctx.shadowBlur=isSel?24:10;
+      roundRect(x,y,w,h,9*pr.s);ctx.fillStyle='rgba(20,27,36,0.94)';ctx.fill();ctx.shadowBlur=0;
+      ctx.fillStyle=c;roundRect(x,y,5*pr.s,h,2.5*pr.s);ctx.fill();
+      ctx.strokeStyle=isSel?'#fff':c;ctx.lineWidth=isSel?2.4:1.6;roundRect(x,y,w,h,9*pr.s);ctx.stroke();
+      ctx.textAlign='left';ctx.fillStyle='#e6edf3';ctx.font='700 '+Math.max(9,12*pr.s)+'px system-ui';
+      ctx.fillText(n.t,x+12*pr.s,pr.y-3*pr.s);
+      ctx.fillStyle='rgba(139,148,158,0.95)';ctx.font=Math.max(8,9.5*pr.s)+'px system-ui';
+      ctx.fillText(n.s,x+12*pr.s,pr.y+12*pr.s);
+    }
+  }
+  N.forEach(n=>n._scr=P[n.id]);
+}
+function roundRect(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+
+function loop(){ if(autorot && !dragging){ yaw+=0.0028; } draw(); requestAnimationFrame(loop); }
+
+// interaction
+let dragging=false,lx=0,ly=0,moved=0;
+cv.addEventListener('mousedown',e=>{dragging=true;lx=e.clientX;ly=e.clientY;moved=0;cv.classList.add('grabbing');});
+window.addEventListener('mousemove',e=>{ if(!dragging)return;
+  const dx=e.clientX-lx,dy=e.clientY-ly;lx=e.clientX;ly=e.clientY;moved+=Math.abs(dx)+Math.abs(dy);
+  yaw+=dx*0.01;pitch=Math.max(-1.35,Math.min(1.35,pitch+dy*0.01)); });
+window.addEventListener('mouseup',e=>{ if(dragging&&moved<4)pick(e); dragging=false;cv.classList.remove('grabbing'); });
+cv.addEventListener('wheel',e=>{e.preventDefault();zoom=Math.max(0.45,Math.min(2.6,zoom*(e.deltaY<0?1.1:0.9)));},{passive:false});
+cv.addEventListener('dblclick',()=>autorot=!autorot);
+
+function pick(e){
+  const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
+  const N=(mode==='modules')?nodes:fnodes; let best=null,bd=1e9;
+  for(const n of N){const s=n._scr;if(!s)continue;const d=Math.hypot(s.x-mx,s.y-my);
+    const rad=(mode==='modules'?n.r*s.s+8:75*s.s); if(d<rad&&d<bd){bd=d;best=n;}}
+  if(best){sel=best;showDetail(best);}
+}
+function showDetail(n){
+  const d=document.getElementById('detail');
+  if(mode==='modules'){
+    const deps=edges.filter(e=>e[0]===n.id).map(e=>e[1]);
+    const used=edges.filter(e=>e[1]===n.id).map(e=>e[0]);
+    d.innerHTML=`<h2>${n.id}.py</h2><div class="role">${n.role}</div>
+      <div><span class="pill">${n.loc} LOC</span><span class="pill" style="border-color:${COLOR[n.g]};color:${COLOR[n.g]}">${n.g}</span></div>
+      <ul>${n.funcs.map(f=>`<li><code>${f}</code></li>`).join('')}</ul>
+      ${deps.length?`<div class="hint">Importa: ${deps.join(', ')}</div>`:''}
+      ${used.length?`<div class="hint">Lo usan: ${used.join(', ')}</div>`:''}`;
+  } else {
+    d.innerHTML=`<h2>${n.t}</h2><div class="role">${n.s}</div>
+      <div><span class="pill" style="border-color:${n.kindColor};color:${n.kindColor}">${n.kind}</span></div>
+      <div class="hint">Etapa ${n.col+1} del flujo EDAN/Visitas.</div>`;
+  }
+}
+function setMode(m){
+  mode=m;sel=null;
+  document.getElementById('btnMod').classList.toggle('active',m==='modules');
+  document.getElementById('btnFlow').classList.toggle('active',m==='flow');
+  // reset camera to a good angle for each mode
+  if(m==='flow'){yaw=0.35;pitch=-0.22;zoom=0.82;} else {yaw=0.6;pitch=-0.35;zoom=1;}
+  renderLegend();
+  const d=document.getElementById('detail');
+  if(m==='flow'){
+    d.innerHTML=`<h2>Flujo de datos EDAN → Visitas</h2>
+      <div class="role">Dos hojas independientes se estandarizan igual, se cruzan por la cascada, se filtran por confianza y se integran.</div>
+      <ul><li><b>Estandarización compartida</b>: normalización IGAC + coords WGS84 en ambas.</li>
+      <li><b>Cascada</b> → <code>match_table</code> (653 pares).</li>
+      <li><b>trust ≥ 0.70</b> descarta los dudosos.</li>
+      <li><b>merge externo</b>: nada se pierde (2 037) → Excel.</li></ul>`;
+  } else {
+    d.innerHTML=`<h2>Grafo de módulos 3D</h2><div class="role">Un anillo por capa, apilados en profundidad. Flechas = imports (A→B: A usa B).</div>
+      <ul><li>Clic en un nodo para ver funciones y rol.</li><li>Arrastrá para orbitar; rueda = zoom.</li></ul>
+      <div class="hint">Grafo de código completo indexado: 327 nodos / 1 268 relaciones.</div>`;
+  }
+}
+function renderLegend(){
+  const L=document.getElementById('legend');
+  const items = (mode==='modules')
+    ? [['found','Fundación'],['tier','Fuente / niveles'],['asm','Ensamblaje'],['orch','Orquestación'],['exp','Experimento']].map(([k,v])=>[COLOR[k],v])
+    : [['source','Fuente'],['proc','Proceso'],['data','Dato'],['cascade','Cascada'],['output','Salida']].map(([k,v])=>[FK[k],v]);
+  L.innerHTML=items.map(([c,v])=>`<div><span class="dot" style="background:${c}"></span>${v}</div>`).join('');
+}
+document.getElementById('btnMod').addEventListener('click',()=>setMode('modules'));
+document.getElementById('btnFlow').addEventListener('click',()=>setMode('flow'));
+
+resize();setMode('modules');loop();
+</script>
+</body>
+</html>

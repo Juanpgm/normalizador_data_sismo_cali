@@ -1,0 +1,13 @@
+# Integración EDAN ↔ Visitas — dependencias
+pandas>=2.0
+numpy>=1.24
+gspread>=6.0
+google-auth>=2.0
+requests>=2.31        # Drive REST calls (exif_coords)
+rapidfuzz>=3.0
+scikit-learn>=1.3
+model2vec>=0.3        # LM semantic tier (CPU, no torch)
+openpyxl>=3.1         # Excel export
+pyproj>=3.5           # MAGNA-SIRGAS (EPSG:3115) → WGS84
+shapely>=2.0          # spatial bridge: point-in-parcel
+pytest>=7.0           # tests

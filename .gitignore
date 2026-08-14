@@ -1,0 +1,23 @@
+# Credentials — never commit
+service_account.json
+*service_account*.json
+.env
+.env.*
+
+# Data and deliverables (contain personal information)
+output/
+data/
+*.xlsx
+*.pkl
+
+# Local environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Tooling-local
+.atl/
+.claude/
