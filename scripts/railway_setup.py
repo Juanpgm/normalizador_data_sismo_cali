@@ -1,35 +1,35 @@
 """Provision and configure the Railway cron services for this project.
 
-One Docker image, three cron services in the `normalizador-sismo-cali` project,
-each with its own schedule and start command:
+The `normalizador-sismo-cali` project has one environment (production) and is
+deployed by CLI upload (`railway up`), not from a connected git repo. All cron
+services share one Docker image but run a different entrypoint on a different
+schedule:
 
-    hourly          python job.py               0 * * * *     tabla_integrada
+    normalizador    python job.py               0 * * * *     tabla_integrada
     integracion-f3  python job_integrar_f3.py   0 */2 * * *   cruce F3 ↔ integrada
     asignaciones    python job_asignaciones.py  0 21 * * *    top-100 priorizado
                                                               (21:00 UTC = 16:00 Bogotá)
 
 Railway reads `cronSchedule`/`startCommand` from the *service instance*, not from
-`railway.json`, so a service configured only by manifest builds the image and
-never runs it. This script writes those settings through the public API so the
-whole fleet is reproducible instead of a set of dashboard clicks.
+`railway.json` — and since every service is uploaded from this same directory,
+`railway.json` deliberately carries neither, so no service can override another's
+command. This script owns those per-service settings and writes them through the
+public API so the whole fleet is reproducible instead of dashboard clicks.
 
-It is idempotent and safe to re-run:
-  * services are matched by name inside the project — an existing one is
-    reused, never duplicated;
-  * a missing service is created, cloning the source repo / branch / root
-    directory of the existing `hourly` service so the new one builds the same
-    image;
-  * settings are only written when they drift from the desired state.
+It creates a service shell and configures its schedule/command/policy. The code
+itself is deployed separately, per service, from this directory:
+
+    railway up --service integracion-f3
+    railway up --service asignaciones
+
+The script is idempotent and safe to re-run: services are matched by name (an
+existing one is reused, never duplicated), and settings are written only when
+they drift from the desired state.
 
     python scripts/railway_setup.py            # apply the whole fleet
     python scripts/railway_setup.py --show     # report only, change nothing
     python scripts/railway_setup.py --dry      # print the plan, create/update nothing
     python scripts/railway_setup.py --only asignaciones   # one service
-
-A created service clones the template's source repo and root directory but NOT
-its branch (the API shape for that is unverified here) — a new service builds
-from the repo's default branch. If the template deploys from a non-default
-branch, set the branch on the new service in the Railway dashboard once.
 
 Auth comes from the Railway CLI session (`railway login`), or RAILWAY_API_TOKEN.
 """
@@ -53,15 +53,12 @@ API = "https://backboard.railway.com/graphql/v2"
 PROJECT_ID = "f32efdbf-a8d5-4a43-9369-cb7b7623c4f6"
 ENVIRONMENT_ID = "4418f451-bd97-4d96-ba6e-b5ecbbd49c9b"
 
-# The already-provisioned hourly service. Its source repo / branch / root
-# directory are the template every new service clones, so all three build the
-# same Dockerfile.
-TEMPLATE_SERVICE_ID = "c4f7fdf7-88bb-42d5-9442-42ac75517bbd"
-
-# Desired fleet. `name` must be unique within the project (idempotency key).
+# Desired fleet. `name` is unique within the project (the idempotency key). The
+# already-provisioned hourly service is named `normalizador`; its id is pinned
+# so a name change never detaches it.
 SERVICES = [
-    {"name": "hourly", "start_command": "python job.py",
-     "cron": "0 * * * *", "service_id": TEMPLATE_SERVICE_ID},
+    {"name": "normalizador", "start_command": "python job.py",
+     "cron": "0 * * * *", "service_id": "c4f7fdf7-88bb-42d5-9442-42ac75517bbd"},
     {"name": "integracion-f3", "start_command": "python job_integrar_f3.py",
      "cron": "0 */2 * * *", "service_id": None},
     {"name": "asignaciones", "start_command": "python job_asignaciones.py",
@@ -107,8 +104,7 @@ LIST_SERVICES = """query($p:String!){
 
 INSTANCE = """query($s:String!,$e:String!){
   serviceInstance(serviceId:$s, environmentId:$e){
-    cronSchedule startCommand rootDirectory restartPolicyType numReplicas
-    source{ repo } } }"""
+    cronSchedule startCommand restartPolicyType numReplicas } }"""
 
 CREATE = "mutation($in:ServiceCreateInput!){ serviceCreate(input:$in){ id } }"
 
@@ -127,30 +123,16 @@ def instance(service_id: str) -> dict:
     return gql(INSTANCE, {"s": service_id, "e": ENVIRONMENT_ID})["serviceInstance"]
 
 
-def create_service(name: str, template: dict) -> str:
-    """Create a service cloning the template's source repo / branch."""
-    source = template.get("source") or {}
-    src_input = {}
-    if source.get("repo"):
-        src_input["repo"] = source["repo"]
-    payload = {"projectId": PROJECT_ID, "name": name}
-    if src_input:
-        payload["source"] = src_input
-    return gql(CREATE, {"in": payload})["serviceCreate"]["id"]
+def create_service(name: str) -> str:
+    """Create an empty service shell. Code is deployed later via `railway up`."""
+    return gql(CREATE, {"in": {"projectId": PROJECT_ID, "name": name}})["serviceCreate"]["id"]
 
 
-def desired(spec: dict, template: dict) -> dict:
-    """Full desired serviceInstance settings for one service."""
-    return {
-        "cronSchedule": spec["cron"],
-        "startCommand": spec["start_command"],
-        "rootDirectory": template.get("rootDirectory"),
-        **COMMON,
-    }
+def desired(spec: dict) -> dict:
+    return {"cronSchedule": spec["cron"], "startCommand": spec["start_command"], **COMMON}
 
 
-def apply_service(spec: dict, template: dict, by_name: dict[str, str],
-                  dry: bool) -> bool:
+def apply_service(spec: dict, by_name: dict[str, str], dry: bool) -> bool:
     name = spec["name"]
     service_id = spec["service_id"] or by_name.get(name)
     newly_created = False
@@ -158,19 +140,18 @@ def apply_service(spec: dict, template: dict, by_name: dict[str, str],
     if not service_id:
         print(f"[{name}] no existe → crear")
         if dry:
-            print(f"  (dry) serviceCreate name={name} "
-                  f"repo={template.get('source', {}).get('repo')}")
+            print("  (dry) serviceCreate (shell vacío; luego `railway up "
+                  f"--service {name}`)")
             return True
-        service_id = create_service(name, template)
+        service_id = create_service(name)
         newly_created = True
-        print(f"  creado service_id={service_id}")
+        print(f"  creado service_id={service_id}  "
+              f"→ desplegá el código: railway up --service {name}")
     else:
         print(f"[{name}] service_id={service_id}")
 
-    want = desired(spec, template)
-    want = {k: v for k, v in want.items() if v is not None}
-    # A just-created service inherits the image default (CMD = job.py, the
-    # hourly pipeline) until configured, so apply the full desired state.
+    want = desired(spec)
+    # A just-created service has no instance settings yet, so apply everything.
     before = {} if newly_created else instance(service_id)
     drift = {k: v for k, v in want.items() if before.get(k) != v}
     if not drift:
@@ -186,9 +167,9 @@ def apply_service(spec: dict, template: dict, by_name: dict[str, str],
     except SystemExit as exc:
         if newly_created:
             print(f"  ⚠️  '{name}' fue CREADO pero NO configurado ({exc}).\n"
-                  f"     Sin startCommand corre `python job.py` (pipeline horario "
-                  f"que escribe tabla_integrada). PAUSÁ el servicio en Railway y "
-                  f"re-corré este script para terminar de configurarlo.")
+                  f"     Sin startCommand corre el CMD del Dockerfile (`python "
+                  f"job.py`, el pipeline horario). Re-corré este script para "
+                  f"terminar de configurarlo antes de desplegarlo.")
         else:
             print(f"  ⚠️  no se pudo aplicar a '{name}': {exc}")
         return False
@@ -210,13 +191,8 @@ def main() -> int:
                     help="report current settings of the fleet, change nothing")
     ap.add_argument("--dry", action="store_true",
                     help="print the plan without creating or updating anything")
-    ap.add_argument("--only", metavar="NAME",
-                    help="target a single service by name")
+    ap.add_argument("--only", metavar="NAME", help="target a single service by name")
     args = ap.parse_args()
-
-    template = instance(TEMPLATE_SERVICE_ID)
-    print(f"Template (hourly): repo={template.get('source', {}).get('repo')} "
-          f"rootDir={template.get('rootDirectory')!r}\n")
 
     by_name = project_services()
     specs = [s for s in SERVICES if not args.only or s["name"] == args.only]
@@ -231,14 +207,13 @@ def main() -> int:
                 continue
             cur = instance(sid)
             print(f"[{spec['name']}] {sid}")
-            for k in ("cronSchedule", "startCommand", "rootDirectory",
-                      "restartPolicyType", "numReplicas"):
+            for k in ("cronSchedule", "startCommand", "restartPolicyType", "numReplicas"):
                 print(f"  {k:20s} {cur.get(k)!r}")
         return 0
 
     # Evaluate every service — never short-circuit, or one early failure would
     # leave the rest of the fleet unprovisioned.
-    results = [apply_service(spec, template, by_name, args.dry) for spec in specs]
+    results = [apply_service(spec, by_name, args.dry) for spec in specs]
     return 0 if all(results) else 1
 
 
