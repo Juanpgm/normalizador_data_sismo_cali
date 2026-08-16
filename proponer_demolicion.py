@@ -22,10 +22,18 @@ Score (0-100) over the gated set, additive and null-safe:
     danos_contrapiso_entrepiso_muroscont (5.8)       -> 8 / 4
     estado_edificacion (3.8) malo                    -> 5
     criterio_habitabilidad (7) I3                    -> 5
+    mencion explicita de demolicion                  -> +20 / +10 (cap 100)
 
-Tiers: score >= 70 -> `demolicion_prioritaria`; 50-69 ->
-`demolicion_probable` (requires on-site structural verification); < 50 is
-dropped so the list stays bounded and defensible.
+Explicit demolition mention is the strongest single signal and drives the
+tiers: the structured `recomendaciones` field carrying the `demoler` token
+(the inspector's own recommendation, +20) or a free-text demolition
+recommendation in observaciones/eval_* (negation-guarded, +10).
+
+Tiers (non-collapse): explicit mention AND base score >= 50 ->
+`demolicion_prioritaria`; no mention but base score >= 70 ->
+`demolicion_probable` (severe damage, needs on-site verification before
+committing to demolition). Everything else is dropped so the list stays
+bounded and anchored on what the inspectors explicitly wrote.
 
 Only the `propuestos_demoler` tab is written; everything else is read-only.
 
@@ -35,6 +43,7 @@ Only the `propuestos_demoler` tab is written; everything else is read-only.
 """
 from __future__ import annotations
 
+import re
 import sys
 from datetime import datetime
 
@@ -53,13 +62,22 @@ SEVERIDAD = {"alto": 1.0, "medio_alto": 0.6, "medio": 0.3, "bajo": 0.1}
 UNSAFE_HABITABILIDAD = {"i2", "i3"}  # insegura por dano estructural
 DANO = {"severo": 1.0, "moderado": 0.5}
 
+TEXT_FIELDS = ("observaciones", "eval_estructural", "eval_otra",
+               "observaciones_generales")
+# �: raw_data headers/text carry mojibake, so "demolici?n" may appear with
+# the replacement char where the accent was.
+DEMOL_RE = re.compile(r"demol|derrib|desmont", re.IGNORECASE)
+NEG_RE = re.compile(r"no\s+(se\s+)?(requiere|recomienda|amerita|necesita)"
+                    r"[^.]{0,40}(demol|derrib|desmont)", re.IGNORECASE)
+
 OUT_COLS = ["prioridad", "id_edan", "categoria", "score", "motivos",
             "direccion", "direccion_norm", "barrio_vereda", "comuna", "coords",
             "n_pisos", "n_ocupantes", "criterio_habitabilidad",
             "estado_edificacion", "colapso_total", "colapso_parcial",
             "asentamiento_severo", "inclinacion_importante", "danos_estructura",
             "danos_contrapiso_entrepiso_muroscont", "severidad_danos",
-            "severidad_danos_calc", "fecha_inspeccion", "fecha_corrida"]
+            "severidad_danos_calc", "recomendaciones", "fecha_inspeccion",
+            "fecha_corrida"]
 
 
 def _s(row, col) -> str:
@@ -68,16 +86,24 @@ def _s(row, col) -> str:
     return "" if s in ("nan", "none") else s
 
 
-def evaluar(row) -> tuple[int, list[str]] | None:
-    """(score, motivos) for a gated row; None when the building is not
-    structurally unsafe per the inspection itself."""
+def mencion_demolicion(row) -> tuple[bool, bool]:
+    """(recomendacion `demoler` marcada, mencion en texto libre sin negacion)."""
+    rec = "demoler" in [t.strip() for t in _s(row, "recomendaciones").split(",")]
+    txt = " | ".join(str(row.get(f, "") or "") for f in TEXT_FIELDS)
+    texto = bool(DEMOL_RE.search(txt)) and not NEG_RE.search(txt)
+    return rec, texto
+
+
+def evaluar(row) -> tuple[int, int, list[str]] | None:
+    """(score, base_score, motivos) for a gated row; None when the building is
+    not structurally unsafe per the inspection itself."""
     colapso_total = _s(row, "colapso_total") == "si"
     habitabilidad = _s(row, "criterio_habitabilidad")
     if not colapso_total and habitabilidad not in UNSAFE_HABITABILIDAD:
         return None
 
     if colapso_total:
-        return 100, ["5.1 colapso total"]
+        return 100, 100, ["5.1 colapso total"]
 
     score, motivos = 0.0, []
     if _s(row, "colapso_parcial") == "si":
@@ -110,7 +136,16 @@ def evaluar(row) -> tuple[int, list[str]] | None:
     if habitabilidad == "i3":
         score += 5
     motivos.insert(0, f"7. habitabilidad {habitabilidad.upper()}")
-    return round(score), motivos
+
+    base = round(score)
+    rec, texto = mencion_demolicion(row)
+    if rec:
+        score += 20
+        motivos.append("recomendacion explicita: demoler")
+    if texto:
+        score += 10
+        motivos.append("texto libre recomienda demolicion")
+    return min(100, round(score)), base, motivos
 
 
 def build_propuestos(df: pd.DataFrame, now: datetime) -> pd.DataFrame:
@@ -119,13 +154,17 @@ def build_propuestos(df: pd.DataFrame, now: datetime) -> pd.DataFrame:
         res = evaluar(src)
         if res is None:
             continue
-        score, motivos = res
-        if score < 50:
+        score, base, motivos = res
+        colapso = _s(src, "colapso_total") == "si"
+        mencion = any(mencion_demolicion(src))
+        if colapso:
+            categoria = "demolicion_inmediata"
+        elif mencion and base >= 50:
+            categoria = "demolicion_prioritaria"
+        elif not mencion and base >= 70:
+            categoria = "demolicion_probable"
+        else:
             continue
-        categoria = ("demolicion_inmediata" if score == 100 and
-                     _s(src, "colapso_total") == "si"
-                     else "demolicion_prioritaria" if score >= 70
-                     else "demolicion_probable")
         rows.append({
             "id_edan": src.get("id_edan", ""),
             "categoria": categoria,
@@ -154,7 +193,7 @@ def _selfcheck():
         {"id_edan": "BBB02", "colapso_total": "no", "criterio_habitabilidad": "h",
          "colapso_parcial": "si", "danos_estructura": "severo",
          "severidad_danos": "alto"},
-        # i2 + everything severe -> prioritaria
+        # i2 + everything severe but NO explicit mention -> probable
         {"id_edan": "CCC03", "colapso_total": "no", "criterio_habitabilidad": "i2",
          "colapso_parcial": "si", "danos_estructura": "severo",
          "severidad_danos": "alto", "inclinacion_importante": "si",
@@ -164,21 +203,42 @@ def _selfcheck():
         # i2 with moderate damage only -> below 50, dropped (bounded list)
         {"id_edan": "DDD04", "colapso_total": "no", "criterio_habitabilidad": "i2",
          "danos_estructura": "moderado", "severidad_danos": "medio"},
-        # i3, partial collapse + severe structure -> probable/prioritaria band
+        # i3, mid base score, no mention -> dropped under the tightened rules
         {"id_edan": "EEE05", "colapso_total": "no", "criterio_habitabilidad": "i3",
          "colapso_parcial": "si", "danos_estructura": "severo",
          "severidad_danos_calc": "medio"},
+        # i2, inspector ticked `demoler` in recomendaciones -> prioritaria
+        {"id_edan": "FFF06", "colapso_total": "no", "criterio_habitabilidad": "i2",
+         "colapso_parcial": "si", "danos_estructura": "severo",
+         "severidad_danos": "medio",
+         "recomendaciones": "evacuar_total,monitoreo,demoler"},
+        # i2, free text explicitly NEGATES demolition -> mention must not fire
+        {"id_edan": "GGG07", "colapso_total": "no", "criterio_habitabilidad": "i2",
+         "colapso_parcial": "si", "danos_estructura": "severo",
+         "severidad_danos": "medio",
+         "observaciones_generales": "no se requiere por ahora demolicion"},
+        # i2, free text recommends demolition -> prioritaria via text signal
+        {"id_edan": "HHH08", "colapso_total": "no", "criterio_habitabilidad": "i2",
+         "colapso_parcial": "si", "danos_estructura": "severo",
+         "severidad_danos": "medio",
+         "eval_estructural": "Se recomienda demolicion de la edificacion"},
     ])
     out = build_propuestos(df, now)
     ids = list(out["id_edan"])
-    assert "BBB02" not in ids and "DDD04" not in ids, ids
+    assert "BBB02" not in ids and "DDD04" not in ids and "EEE05" not in ids, ids
+    assert "GGG07" not in ids, ids  # negated text never counts as a mention
     assert ids[0] == "AAA01" and out.iloc[0]["categoria"] == "demolicion_inmediata"
     r = out[out["id_edan"] == "CCC03"].iloc[0]
-    assert r["score"] == 95 and r["categoria"] == "demolicion_prioritaria", r["score"]
+    assert r["score"] == 95 and r["categoria"] == "demolicion_probable", r["score"]
     assert "5.7 dano estructural severo" in r["motivos"]
-    r = out[out["id_edan"] == "EEE05"].iloc[0]
-    assert r["score"] == round(25 + 20 + 15 * 0.3 + 5) == 54, r["score"]
-    assert r["categoria"] == "demolicion_probable"
+    r = out[out["id_edan"] == "FFF06"].iloc[0]
+    base = round(25 + 20 + 15 * 0.3)  # 50 (banker's rounding of 49.5)
+    assert base == 50 and r["score"] == base + 20 == 70, r["score"]
+    assert r["categoria"] == "demolicion_prioritaria"
+    assert "recomendacion explicita: demoler" in r["motivos"]
+    r = out[out["id_edan"] == "HHH08"].iloc[0]
+    assert r["score"] == 60 and r["categoria"] == "demolicion_prioritaria", r["score"]
+    assert "texto libre recomienda demolicion" in r["motivos"]
     assert list(out.columns) == OUT_COLS
     assert (out["score"].diff().dropna() <= 0).all()
     assert build_propuestos(pd.DataFrame(), now).empty
