@@ -6,6 +6,12 @@ list to the `propuestos_demoler` tab of the EDAN-F3 spreadsheet.
 
 Methodology (structural-engineering reading of the form):
 
+Source universe — only F3 records with a full three-source match are
+considered: rows of the `integracion_f3` tab where `sitio_id` (EDAN form),
+`visita_id` (Visitas) and `edan_id` (F3) are all present with a real
+match_method. An F3 inspection corroborated by the other two sources is the
+only evidence strong enough to propose demolition.
+
 Gate — a building can only be proposed for demolition when the inspection
 itself declares it structurally unsafe: total collapse (5.1) or habitability
 verdict I2/I3 (7. insegura por dano estructural). Buildings rated H/R1/R2/I1
@@ -54,6 +60,7 @@ from integracion.gauth import credentials
 
 F3_SPREADSHEET_ID = "19k--nAEScol_3E7nbSpPev07gW2_UT8ojSsaMGbn6Ds"
 SRC_TAB = "tabla_normalizada"
+MATCH_TAB = "integracion_f3"
 DST_TAB = "propuestos_demoler"
 READONLY = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 WRITE = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -70,7 +77,7 @@ DEMOL_RE = re.compile(r"demol|derrib|desmont", re.IGNORECASE)
 NEG_RE = re.compile(r"no\s+(se\s+)?(requiere|recomienda|amerita|necesita)"
                     r"[^.]{0,40}(demol|derrib|desmont)", re.IGNORECASE)
 
-OUT_COLS = ["prioridad", "id_edan", "categoria", "score", "motivos",
+OUT_COLS = ["prioridad", "id_edan", "registro_id", "categoria", "score", "motivos",
             "direccion", "direccion_norm", "barrio_vereda", "comuna", "coords",
             "n_pisos", "n_ocupantes", "criterio_habitabilidad",
             "estado_edificacion", "colapso_total", "colapso_parcial",
@@ -148,9 +155,29 @@ def evaluar(row) -> tuple[int, int, list[str]] | None:
     return min(100, round(score)), base, motivos
 
 
-def build_propuestos(df: pd.DataFrame, now: datetime) -> pd.DataFrame:
+def match_3fuentes(df_match: pd.DataFrame) -> dict[str, str]:
+    """F3 id_edan -> registro_id(s) for rows matched across all three sources
+    (EDAN sitio_id + Visitas visita_id + F3 edan_id, real match_method)."""
+    need = {"sitio_id", "visita_id", "edan_id", "match_method", "registro_id"}
+    if df_match.empty or not need.issubset(df_match.columns):
+        return {}
+    ne = lambda c: df_match[c].astype(str).str.strip().ne("")  # noqa: E731
+    full = df_match[ne("sitio_id") & ne("visita_id") & ne("edan_id")
+                    & ~df_match["match_method"].isin(["", "solo_f3"])]
+    out: dict[str, str] = {}
+    for _, r in full.iterrows():
+        eid = str(r["edan_id"]).strip()
+        rid = str(r["registro_id"]).strip()
+        out[eid] = f"{out[eid]}; {rid}" if eid in out else rid
+    return out
+
+
+def build_propuestos(df: pd.DataFrame, now: datetime,
+                     match3: dict[str, str] | None = None) -> pd.DataFrame:
     rows = []
     for _, src in df.iterrows():
+        if match3 is not None and str(src.get("id_edan", "")).strip() not in match3:
+            continue
         res = evaluar(src)
         if res is None:
             continue
@@ -167,12 +194,13 @@ def build_propuestos(df: pd.DataFrame, now: datetime) -> pd.DataFrame:
             continue
         rows.append({
             "id_edan": src.get("id_edan", ""),
+            "registro_id": (match3 or {}).get(str(src.get("id_edan", "")).strip(), ""),
             "categoria": categoria,
             "score": score,
             "motivos": "; ".join(motivos),
             **{c: src.get(c, "") for c in OUT_COLS
-               if c not in ("prioridad", "id_edan", "categoria", "score",
-                            "motivos", "fecha_corrida")},
+               if c not in ("prioridad", "id_edan", "registro_id", "categoria",
+                            "score", "motivos", "fecha_corrida")},
         })
     out = pd.DataFrame(rows)
     if out.empty:
@@ -242,6 +270,23 @@ def _selfcheck():
     assert list(out.columns) == OUT_COLS
     assert (out["score"].diff().dropna() <= 0).all()
     assert build_propuestos(pd.DataFrame(), now).empty
+
+    # Three-source filter: only F3 ids present in the match dict survive,
+    # and the integrated registro_id is carried into the output.
+    df_match = pd.DataFrame({
+        "registro_id": ["R1-AAA01", "R2-FFF06", "R2-XTRA9", "R3-HHH08", ""],
+        "sitio_id": ["S1", "S2", "S2", "", "S9"],
+        "visita_id": ["V1", "V2", "V2", "V3", "V9"],
+        "edan_id": ["AAA01", "FFF06", "FFF06", "HHH08", "ZZZ99"],
+        "match_method": ["handshake", "geo", "vector", "handshake", "solo_f3"],
+    })
+    m3 = match_3fuentes(df_match)
+    assert set(m3) == {"AAA01", "FFF06"}, m3  # HHH08 lacks sitio_id; ZZZ99 solo_f3
+    assert m3["FFF06"] == "R2-FFF06; R2-XTRA9"
+    out3 = build_propuestos(df, now, m3)
+    assert set(out3["id_edan"]) == {"AAA01", "FFF06"}, list(out3["id_edan"])
+    assert out3[out3["id_edan"] == "AAA01"]["registro_id"].iloc[0] == "R1-AAA01"
+    assert match_3fuentes(pd.DataFrame()) == {}
     print("selfcheck ok")
 
 
@@ -262,8 +307,9 @@ def main() -> None:
 
     gc = gspread.authorize(credentials(READONLY))
     df = _read_tab(gc, F3_SPREADSHEET_ID, SRC_TAB)
-    print(f"{SRC_TAB}: {len(df)} registros")
-    out = build_propuestos(df, datetime.now())
+    match3 = match_3fuentes(_read_tab(gc, F3_SPREADSHEET_ID, MATCH_TAB))
+    print(f"{SRC_TAB}: {len(df)} registros | match 3 fuentes: {len(match3)}")
+    out = build_propuestos(df, datetime.now(), match3)
     counts = out["categoria"].value_counts().to_dict() if not out.empty else {}
     print(f"propuestos: {len(out)} | {counts}")
 
