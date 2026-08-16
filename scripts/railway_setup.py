@@ -64,6 +64,11 @@ SERVICES = [
     {"name": "asignaciones", "start_command": "python job_asignaciones.py",
      "cron": "0 21 * * *",   # 16:00 America/Bogota (UTC-5)
      "service_id": "d46b3e86-3507-4597-ba65-250b6654cbd3"},
+    # Refreshes the Vercel dashboard from the F3 Sheet. Different image entirely
+    # (deploy/ in the dashboard repo): its Dockerfile CMD is the entrypoint, so
+    # no startCommand override — this script only owns its schedule.
+    {"name": "dashboard-refresh", "start_command": None,
+     "cron": "0 * * * *", "service_id": "156e97a2-596b-4861-95f4-4060dab408e2"},
 ]
 
 COMMON = {"restartPolicyType": "NEVER", "numReplicas": 1}
@@ -130,7 +135,10 @@ def create_service(name: str) -> str:
 
 
 def desired(spec: dict) -> dict:
-    return {"cronSchedule": spec["cron"], "startCommand": spec["start_command"], **COMMON}
+    d = {"cronSchedule": spec["cron"], **COMMON}
+    if spec.get("start_command"):   # None -> keep the image's Dockerfile CMD
+        d["startCommand"] = spec["start_command"]
+    return d
 
 
 def apply_service(spec: dict, by_name: dict[str, str], dry: bool) -> bool:
@@ -168,9 +176,8 @@ def apply_service(spec: dict, by_name: dict[str, str], dry: bool) -> bool:
     except SystemExit as exc:
         if newly_created:
             print(f"  ⚠️  '{name}' fue CREADO pero NO configurado ({exc}).\n"
-                  f"     Sin startCommand corre el CMD del Dockerfile (`python "
-                  f"job.py`, el pipeline horario). Re-corré este script para "
-                  f"terminar de configurarlo antes de desplegarlo.")
+                  f"     Queda sin cronSchedule (no se agenda). Re-corré este "
+                  f"script para terminar de configurarlo antes de desplegarlo.")
         else:
             print(f"  ⚠️  no se pudo aplicar a '{name}': {exc}")
         return False
