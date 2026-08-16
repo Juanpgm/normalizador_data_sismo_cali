@@ -37,6 +37,7 @@ from shapely.strtree import STRtree
 
 from integracion.config import (EDAN_SPREADSHEET_ID, VISITAS_SHEET_NAME,
                                 VISITAS_SPREADSHEET_ID)
+from integracion.coords import parse_latlon
 from integracion.gauth import credentials
 
 F3_SPREADSHEET_ID = "19k--nAEScol_3E7nbSpPev07gW2_UT8ojSsaMGbn6Ds"
@@ -211,9 +212,21 @@ def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
         return pd.DataFrame(columns=OUT_COLS)
     pending = df_integrada[~df_integrada["registro_id"].astype(str).isin(done)].copy()
 
-    # reindex keeps this a Series (all-NaN) even if the sheet header drifts
+    # coords string column: the newer pipeline emits a single `coords`, the
+    # older one `coords_unificadas`. Prefer whichever the sheet actually has.
+    coords_col = next((c for c in ("coords_unificadas", "coords")
+                       if c in pending.columns), None)
+
+    # lat/lon: explicit columns when present, else parsed from the coords string
+    # (Cali-bbox guarded). reindex keeps a Series even if a column is absent, so
+    # a schema that drops lat/lon degrades to the coords fallback, not a crash.
     lat = pd.to_numeric(pending.reindex(columns=["lat"])["lat"], errors="coerce")
     lon = pd.to_numeric(pending.reindex(columns=["lon"])["lon"], errors="coerce")
+    if coords_col is not None:
+        need = lat.isna() | lon.isna()
+        parsed = pending.loc[need, coords_col].map(parse_latlon)
+        lat.loc[need] = parsed.map(lambda t: t[0] if t else float("nan"))
+        lon.loc[need] = parsed.map(lambda t: t[1] if t else float("nan"))
 
     geoms = [shape(f["geometry"]) for f in zones]
     props = [f["properties"] for f in zones]
@@ -250,7 +263,7 @@ def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
             "direccion": src.get("direccion_unificada", ""),
             "comuna_corregimiento": src.get("comuna_unificada", ""),
             "barrio_vereda": src.get("barrio_unificado", ""),
-            "coords": src.get("coords_unificadas", ""),
+            "coords": src.get(coords_col, "") if coords_col else "",
             "zona_id": zone["zone_id"] if zone else "",
             "ola": zone["ola"] if zone else "",
             "despacho": zone["despacho"] if zone else "",
@@ -377,11 +390,15 @@ def _selfcheck():
     out2 = build_asignaciones(df_integrada, done, zones, ts, now, top=100)
     assert list(out2["id_asignacion"]) == list(out["id_asignacion"])  # stable across runs
 
-    # Degraded inputs never crash: empty frames and header drift -> empty output
+    # Degraded inputs never crash: empty frames -> empty output
     assert f3_done_registros(pd.DataFrame()) == set()
     assert build_asignaciones(pd.DataFrame(), set(), zones, {}, now).empty
-    sin_coords_cols = df_integrada.drop(columns=["lat", "lon"])
-    assert build_asignaciones(sin_coords_cols, done, zones, ts, now).empty
+    # New pipeline schema: single `coords` column, no lat/lon -> parse fallback
+    solo_coords = (df_integrada.drop(columns=["lat", "lon"])
+                   .rename(columns={"coords_unificadas": "coords"}))
+    out_fb = build_asignaciones(solo_coords, done, zones, ts, now)
+    assert set(out_fb["registro_id"]) == set(out["registro_id"]), out_fb["registro_id"].tolist()
+    assert (out_fb["coords"].astype(str).str.strip() != "").all()
     print("selfcheck ok")
 
 
