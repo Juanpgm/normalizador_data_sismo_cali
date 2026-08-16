@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -45,10 +46,26 @@ DST_TAB = "asignaciones"
 READONLY = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 WRITE = ["https://www.googleapis.com/auth/spreadsheets"]
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-KML_PATH = REPO_ROOT / "basemaps" / "Mapa de Priorización 15_08_2026.kml"
-GEOJSON_PATH = REPO_ROOT / "basemaps" / "zonas_asignacion.geojson"
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parents[0]
+# KML search order: $ZONAS_KML → repo-root basemaps (dev) → vendored basemaps
+# (container). Glob a "prioriz" pattern so the dated filename can change without
+# a code edit; newest name wins.
+KML_DIRS = [REPO_ROOT / "basemaps", HERE / "basemaps"]
 KML_NS = "{http://www.opengis.net/kml/2.2}"
+
+
+def resolve_kml() -> Path:
+    env = os.environ.get("ZONAS_KML", "").strip()
+    if env:
+        return Path(env)
+    for d in KML_DIRS:
+        hits = sorted(d.glob("*rioriz*.kml"))
+        if hits:
+            return hits[-1]
+    raise FileNotFoundError(
+        f"No encontré el KML de priorización (busqué en {[str(d) for d in KML_DIRS]}; "
+        "o definí ZONAS_KML)")
 ZONES_FOLDER_HINT = "Zonas de asignaci"  # accent-safe prefix
 
 # Tuning knob: component weights of the 0-100 priority score.
@@ -61,7 +78,8 @@ WEIGHTS = {
     "ola_zona": 5,             # KML zone wave: OLA 1=1.0 OLA 2=0.5
 }
 
-OUT_COLS = ["prioridad", "id_asignacion", "score", "registro_id", "direccion", "comuna", "barrio",
+OUT_COLS = ["prioridad", "id_asignacion", "score", "registro_id", "direccion",
+            "comuna_corregimiento", "barrio_vereda",
             "coords", "zona_id", "ola", "despacho", "nivel_riesgo",
             "estado_estructura", "requiere_demolicion", "antiguedad_dias",
             "timestamp_registro", "flags", "fecha_corrida"]
@@ -230,8 +248,8 @@ def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
             "id_asignacion": id_asignacion(src.get("registro_id", "")),
             "registro_id": src.get("registro_id", ""),
             "direccion": src.get("direccion_unificada", ""),
-            "comuna": src.get("comuna_unificada", ""),
-            "barrio": src.get("barrio_unificado", ""),
+            "comuna_corregimiento": src.get("comuna_unificada", ""),
+            "barrio_vereda": src.get("barrio_unificado", ""),
             "coords": src.get("coords_unificadas", ""),
             "zona_id": zone["zone_id"] if zone else "",
             "ola": zone["ola"] if zone else "",
@@ -399,15 +417,20 @@ def _read_tab(gc, spreadsheet_id, tab) -> pd.DataFrame:
     return pd.DataFrame(data, columns=header)
 
 
-def main():
+def main() -> dict:
     if "--check" in sys.argv:
         _selfcheck()
-        return
+        return {}
     top = int(sys.argv[sys.argv.index("--top") + 1]) if "--top" in sys.argv else 100
 
-    zones = parse_zonas_kml(KML_PATH)
-    write_geojson(zones, GEOJSON_PATH)
-    print(f"{len(zones)} zonas KML -> {GEOJSON_PATH.name}")
+    kml_path = resolve_kml()
+    zones = parse_zonas_kml(kml_path)
+    geojson_path = kml_path.parent / "zonas_asignacion.geojson"
+    try:
+        write_geojson(zones, geojson_path)
+        print(f"{len(zones)} zonas desde {kml_path.name} -> {geojson_path.name}")
+    except OSError as exc:  # geojson es un subproducto, no bloquear la corrida
+        print(f"{len(zones)} zonas desde {kml_path.name} (geojson no escrito: {exc})")
 
     gc = gspread.authorize(credentials(READONLY))
     df_integrada = _read_tab(gc, EDAN_SPREADSHEET_ID, INTEGRADA_TAB)
@@ -421,14 +444,18 @@ def main():
     out = build_asignaciones(df_integrada, done, zones, ts_by_visita, now, top=top)
     n_zona = int(out["zona_id"].astype(str).str.strip().ne("").sum())
     n_ts = int(out["antiguedad_dias"].astype(str).str.strip().ne("").sum())
+    score_max = float(out["score"].max()) if not out.empty else 0.0
+    score_min = float(out["score"].min()) if not out.empty else 0.0
     print(f"asignaciones: {len(out)} puntos | con zona: {n_zona} | con antiguedad: {n_ts} "
-          f"| score max/min: {out['score'].max()}/{out['score'].min()}")
+          f"| score max/min: {score_max}/{score_min}")
+    summary = {"puntos": len(out), "con_zona": n_zona, "con_antiguedad": n_ts,
+               "zonas_kml": len(zones), "registros_con_f3": len(done)}
 
     if "--dry" in sys.argv:
         path = "output/asignaciones.xlsx"
         out.to_excel(path, index=False)
         print(f"dry run: wrote {path} (no sheet write)")
-        return
+        return summary
 
     ss = gspread.authorize(credentials(WRITE)).open_by_key(F3_SPREADSHEET_ID)
     try:
@@ -439,6 +466,7 @@ def main():
     dst.clear()
     dst.update(values=values, range_name="A1", value_input_option="RAW")
     print(f"wrote {len(out)} rows to {DST_TAB}")
+    return summary
 
 
 if __name__ == "__main__":

@@ -161,10 +161,10 @@ def _selfcheck():
     print("selfcheck ok")
 
 
-def main():
+def main() -> dict:
     if "--check" in sys.argv:
         _selfcheck()
-        return
+        return {}
 
     gc = gspread.authorize(credentials(READONLY))
     df_f3 = _read_tab(gc, F3_SPREADSHEET_ID, F3_SRC_TAB)
@@ -180,18 +180,22 @@ def main():
           f"| pendientes de asignar: {int(pending.sum())} "
           f"| F3 nuevos anexados: {int(solo_f3.sum())}")
     print("por metodo:", dict(Counter(out.loc[pairs, "match_method"])))
+    summary = {"filas": len(out), "registros_con_f3": int(n_reg_con_f3),
+               "pares": int(pairs.sum()), "pendientes": int(pending.sum()),
+               "f3_nuevos": int(solo_f3.sum())}
 
     if "--dry" in sys.argv:
         path = "output/integracion_f3.xlsx"
         out.to_excel(path, index=False)
         print(f"dry run: wrote {path} (no sheet write)")
-        return
+        return summary
 
     dst = gspread.authorize(credentials(WRITE)).open_by_key(F3_SPREADSHEET_ID).worksheet(DST_TAB)
     values = [OUT_COLS] + out.astype(str).where(out.notna(), "").values.tolist()
     dst.clear()
     dst.update(values=values, range_name="A1", value_input_option="RAW")
     print(f"wrote {len(out)} rows to {DST_TAB}")
+    return summary
 
 
 if __name__ == "__main__":
