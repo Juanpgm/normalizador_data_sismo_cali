@@ -1,7 +1,11 @@
 """Knowledge-graph-driven analysis of EDE free-text fields.
 
-Loads `knowledge/kg.json` (curated from NSR-10 / AIS manual, see
-knowledge/build_kg.py) and scores inspection comments against it:
+Loads `<repo_root>/knowledge/kg.json` (curated from NSR-10 / AIS manual, see
+knowledge/build_kg.py) and scores inspection comments against it. The
+knowledge/ folder lives at the parent project's root (sibling of
+integracion_F1, not inside it) — this module reaches one level up for it, so
+it only works when integracion_F1 is checked out alongside the main repo, as
+it is on this workspace.
 
     analizar(texto) -> {
         "hallazgos":     [(patologia_id, elemento_id | None, cita)],
@@ -28,7 +32,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-KG_PATH = Path(__file__).resolve().parent / "knowledge" / "kg.json"
+KG_PATH = Path(__file__).resolve().parent.parent / "knowledge" / "kg.json"
 
 # Generic negation: "no|sin|no se (requiere|recomienda|presenta|observa|...)"
 # shortly before the concept, within the same sentence.
