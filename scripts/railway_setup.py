@@ -60,9 +60,10 @@ SERVICES = [
     {"name": "normalizador", "start_command": "python job.py",
      "cron": "0 * * * *", "service_id": "c4f7fdf7-88bb-42d5-9442-42ac75517bbd"},
     {"name": "integracion-f3", "start_command": "python job_integrar_f3.py",
-     "cron": "0 */2 * * *", "service_id": None},
+     "cron": "0 */2 * * *", "service_id": "10573e05-b476-4296-80f9-8dd10c2c55cb"},
     {"name": "asignaciones", "start_command": "python job_asignaciones.py",
-     "cron": "0 21 * * *", "service_id": None},   # 16:00 America/Bogota (UTC-5)
+     "cron": "0 21 * * *",   # 16:00 America/Bogota (UTC-5)
+     "service_id": "d46b3e86-3507-4597-ba65-250b6654cbd3"},
 ]
 
 COMMON = {"restartPolicyType": "NEVER", "numReplicas": 1}
