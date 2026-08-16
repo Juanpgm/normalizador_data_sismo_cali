@@ -16,9 +16,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "from model2vec import StaticModel; StaticModel.from_pretrained('minishlab/potion-multilingual-128M')"
 
 COPY integracion/ ./integracion/
-COPY job.py run_integration.py ./
+COPY basemaps/ ./basemaps/
+COPY job.py run_integration.py \
+     integrar_f3.py asignar_f3.py job_integrar_f3.py job_asignaciones.py ./
 
 # Logs land on the mounted volume; the job degrades to stdout-only if absent.
 ENV LOG_DIR=/data/logs
 
+# One image, three cron services: each Railway service overrides the start
+# command (job.py hourly · job_integrar_f3.py every 2h · job_asignaciones.py
+# daily 16:00 Bogota). See scripts/railway_setup.py.
 CMD ["python", "job.py"]
