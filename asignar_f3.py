@@ -592,8 +592,14 @@ def export_web(out: pd.DataFrame, zones: list[dict], now: datetime) -> None:
     (web_data / "asignaciones.json").write_text(
         json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     write_geojson(zones, web_data / "zonas_asignacion.geojson")
+    # xlsx download for the dashboard button (sheet columns only, no lat/lon).
+    try:
+        out[OUT_COLS].to_excel(web_data / "asignaciones.xlsx", index=False)
+        xlsx_note = " + asignaciones.xlsx"
+    except Exception as exc:  # noqa: BLE001 - openpyxl may be absent; xlsx is optional
+        xlsx_note = f" (xlsx no escrito: {exc})"
     print(f"web export: {len(records)} filas -> web/data/asignaciones.json "
-          f"+ zonas_asignacion.geojson")
+          f"+ zonas_asignacion.geojson{xlsx_note}")
 
 
 def main() -> dict:
