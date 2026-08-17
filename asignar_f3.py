@@ -263,6 +263,17 @@ def _num(v) -> float:
         return 0.0
 
 
+def normalize_comuna(v) -> str:
+    """Canonicalize comuna to 'Comuna N'. tabla_integrada.comuna_unificada comes
+    from raw form text, so a bare number ('19') or any casing ('comuna19',
+    'COMUNA 5') is normalized; corregimientos and other free text pass through."""
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    m = re.fullmatch(r"(?:comuna\s*)?(\d{1,2})", s, re.IGNORECASE)
+    return f"Comuna {int(m.group(1))}" if m else s
+
+
 # ── Core build ────────────────────────────────────────────────────────────────
 def f3_done_registros(df_f3_match: pd.DataFrame) -> set[str]:
     """registro_ids that already have an F3 (same derivation as integrar_f3)."""
@@ -338,7 +349,7 @@ def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
             "id_asignacion": id_asignacion(src.get("registro_id", "")),
             "registro_id": src.get("registro_id", ""),
             "direccion": src.get("direccion_unificada", ""),
-            "comuna_corregimiento": src.get("comuna_unificada", ""),
+            "comuna_corregimiento": normalize_comuna(src.get("comuna_unificada", "")),
             "barrio_vereda": src.get("barrio_unificado", ""),
             "coords": src.get(coords_col, "") if coords_col else "",
             "lat": round(float(y), 6),
@@ -446,6 +457,13 @@ def _selfcheck():
     assert graph_severity("solo una fisura capilar") == 0.25
     assert graph_severity("edificación en buen estado") == 0.0
     assert graph_severity("") == 0.0
+    # Comuna: bare number / any casing -> 'Comuna N'; corregimiento passes through.
+    assert normalize_comuna("19") == "Comuna 19"
+    assert normalize_comuna("comuna19") == "Comuna 19"
+    assert normalize_comuna("COMUNA 5") == "Comuna 5"
+    assert normalize_comuna("Comuna 3") == "Comuna 3"
+    assert normalize_comuna("Corregimiento La Buitrera") == "Corregimiento La Buitrera"
+    assert normalize_comuna("") == "" and normalize_comuna(None) == ""
     # Victims: any casualty > 0, fatalities weigh most, monotonic, saturating <1.
     assert victim_factor(0, 0, 0) == 0.0
     assert 0.0 < victim_factor(0, 0, 1) < victim_factor(0, 1, 0) < victim_factor(1, 0, 0) < 1.0
@@ -464,7 +482,7 @@ def _selfcheck():
         "visita_id": ["1111", "2222", "3333", ""],
         "direccion_unificada": ["CL 1 # 2-3", "CL 4 # 5-6", "CL 7 # 8-9", "CL 10"],
         "barrio_unificado": ["B1", "B2", "B3", "B4"],
-        "comuna_unificada": ["Comuna 3", "Comuna 3", "Comuna 19", "Comuna 5"],
+        "comuna_unificada": ["Comuna 3", "Comuna 3", "19", "Comuna 5"],  # "19" bare
         "lat": ["3.445", "3.445", "3.405", ""],
         "lon": ["-76.535", "-76.535", "-76.555", ""],
         "coords_unificadas": ["3.445, -76.535", "3.445, -76.535", "3.405, -76.555", ""],
@@ -500,6 +518,7 @@ def _selfcheck():
     r_mid = pend[pend["registro_id"] == "CCCC-3333"].iloc[0]   # in multipolygon zone
     assert r_mid["zona_id"] == "C19-Z01" and r_mid["ola"] == "2"
     assert r_mid["grafo_severidad"] == 0.25
+    assert r_mid["comuna_corregimiento"] == "Comuna 19"        # "19" bare -> normalized
 
     vis = out[out["estado_visita"] == "visitado"]
     assert (vis["prioridad"].astype(str) == "").all()          # visitados sin orden de worklist
