@@ -1,18 +1,20 @@
 """Prioritized F3 assignments from tabla_integrada + KML assignment zones.
 
-Reads `tabla_integrada` (EDAN SISMO sheet) and the `integracion_f3` tab to find
-registros that still have NO F3 inspection, assigns each pending point to an
-assignment-zone polygon from the KML priorization map, scores every point with
-a null-safe weighted sum (age of the original Google Forms record, risk level,
-structure condition, demolition flag, victims, zone wave), and writes the top-N
-ranked list to the `asignaciones` tab of the EDAN-F3 spreadsheet. It also
-exports the KML zones as `basemaps/zonas_asignacion.geojson`.
+Reads `tabla_integrada` (EDAN SISMO sheet) and the `integracion_f3` tab and
+builds a persistent assignment roster: every geolocated registro is tagged
+`visitado` (already has an F3 in `integracion_f3`) or `pendiente`, and each is
+placed in an assignment-zone polygon from the KML priorization map. Pendientes
+are scored with a null-safe weighted sum and only the top-N ranked ones are
+kept; visitados are all kept so the dashboard shows visited-vs-pending progress.
 
-Every scoring component degrades to 0 when its field is missing, so the run
-never aborts on incomplete data. Points already matched in `integracion_f3`
-are excluded, so successive runs walk through the remaining coverage.
+The score blends NSR-10/AIS structural severity of the reported damage (via the
+knowledge graph in `knowledge/kg.json`), a graded victim factor (fatalities >
+trapped > rescued, saturating), record age, risk level, demolition flag, and
+zone wave. Every component degrades to 0 when its field is missing.
 
-Only the `asignaciones` tab is ever written. All other tabs are read-only.
+Outputs: the `asignaciones` tab of the EDAN-F3 spreadsheet, plus static
+dashboard artifacts `web/data/asignaciones.json` and
+`web/data/zonas_asignacion.geojson`. All source tabs are read-only.
 
     python asignar_f3.py --check     # offline self-check, no network
     python asignar_f3.py --dry       # real data, write output/asignaciones.xlsx only
@@ -21,6 +23,7 @@ Only the `asignaciones` tab is ever written. All other tabs are read-only.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -71,19 +74,31 @@ ZONES_FOLDER_HINT = "Zonas de asignaci"  # accent-safe prefix
 
 # Tuning knob: component weights of the 0-100 priority score.
 WEIGHTS = {
-    "antiguedad": 35,          # days since the Google Forms timestamp, min-max normalized
-    "nivel_riesgo": 25,        # Alto=1.0 Medio=0.6 Bajo=0.3
-    "estado_estructura": 15,   # keyword severity of the reported condition
+    "grafo_severidad": 30,     # NSR-10/AIS structural severity of the reported damage
+    "victimas": 25,            # graded: 3·fallecidos + 2·atrapamientos + 1·rescatados
+    "antiguedad": 20,          # days since the Google Forms timestamp, min-max normalized
+    "nivel_riesgo": 10,        # Alto=1.0 Medio=0.6 Bajo=0.3
     "requiere_demolicion": 10,
-    "victimas": 10,            # any fallecidos/atrapamientos reported
     "ola_zona": 5,             # KML zone wave: OLA 1=1.0 OLA 2=0.5
 }
 
-OUT_COLS = ["prioridad", "id_asignacion", "score", "registro_id", "direccion",
-            "comuna_corregimiento", "barrio_vereda",
-            "coords", "zona_id", "ola", "despacho", "nivel_riesgo",
-            "estado_estructura", "requiere_demolicion", "antiguedad_dias",
-            "timestamp_registro", "flags", "fecha_corrida"]
+# Victim severity saturates: weighted-count -> [0,1). 1 fatality -> 0.78,
+# 2 -> 0.95. ponytail: smooth curve, no batch dependency, tunable via decay.
+VICTIM_DECAY = 0.6
+
+# Free-text columns of tabla_integrada scanned for graph pathology terms.
+DAMAGE_TEXT_COLS = ("descripcion_edan", "descripcion_visita",
+                    "estado_estructura", "nombre_estructura")
+
+OUT_COLS = ["prioridad", "estado_visita", "id_asignacion", "score", "registro_id",
+            "direccion", "comuna_corregimiento", "barrio_vereda", "coords",
+            "zona_id", "ola", "despacho", "nivel_riesgo", "estado_estructura",
+            "grafo_severidad", "n_fallecidos", "n_atrapamientos", "n_rescatados",
+            "requiere_demolicion", "antiguedad_dias", "timestamp_registro",
+            "flags", "fecha_corrida"]
+# Extra columns kept on the frame for the web export (lat/lon to plot points);
+# not written to the Google Sheet, which uses OUT_COLS only.
+WEB_EXTRA_COLS = ["lat", "lon"]
 
 
 # ── KML zones ─────────────────────────────────────────────────────────────────
@@ -152,17 +167,70 @@ def riesgo_value(v) -> float:
     return 0.0
 
 
-def estado_value(v) -> float:
-    s = str(v or "").strip().lower()
-    if not s or s in ("nan", "none", "-"):
+# ── Graph-grounded structural severity (NSR-10 / AIS knowledge graph) ─────────
+# Chain: term regex --detecta--> pathology --indica(peso)--> normative criterion.
+# The `peso` of the pathology->criterion edge is the NSR-10/AIS severity of the
+# damage (fisura 0.25 ... aplastamiento/pandeo/desplome 0.9). graph_severity
+# returns the max peso among pathologies whose detection regex fires on the text.
+KG_DIRS = [REPO_ROOT / "knowledge", HERE / "knowledge"]
+
+
+def _resolve_kg() -> Path | None:
+    env = os.environ.get("KG_JSON", "").strip()
+    if env:
+        return Path(env)
+    for d in KG_DIRS:
+        p = d / "kg.json"
+        if p.exists():
+            return p
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def _graph_terms() -> list[tuple[re.Pattern, float]]:
+    """(compiled term regex, severity peso) pairs, sorted by peso desc so the
+    first regex match is the worst pathology. Empty when kg.json is absent."""
+    path = _resolve_kg()
+    if path is None:
+        print("WARN: kg.json no encontrado; grafo_severidad=0 para todos")
+        return []
+    kg = json.loads(path.read_text(encoding="utf-8"))
+    nodes = {n["id"]: n for n in kg.get("nodes", [])}
+    sev: dict[str, float] = {}          # pathology id -> max 'indica' peso
+    detecta: dict[str, str] = {}        # term id -> pathology id
+    for e in kg.get("edges", []):
+        rel = e.get("relacion")
+        if rel == "indica":
+            sev[e["de"]] = max(sev.get(e["de"], 0.0), float(e.get("peso", 0) or 0))
+        elif rel == "detecta":
+            detecta[e["de"]] = e["a"]
+    terms = []
+    for tid, pid in detecta.items():
+        patron = nodes.get(tid, {}).get("patron")
+        if patron and pid in sev:       # skip element terms (no severity edge)
+            terms.append((re.compile(patron, re.IGNORECASE), sev[pid]))
+    terms.sort(key=lambda t: t[1], reverse=True)
+    return terms
+
+
+def graph_severity(text) -> float:
+    """Max NSR-10/AIS severity peso of any pathology detected in the damage text;
+    0.0 when nothing matches (null-safe)."""
+    s = str(text or "")
+    if not s.strip():
         return 0.0
-    if "colaps" in s:
-        return 1.0
-    if "riesgo" in s or "grave" in s:
-        return 0.8
-    if "afectad" in s or "dano" in s or "daño" in s:
-        return 0.6
-    return 0.4
+    for pat, w in _graph_terms():
+        if pat.search(s):
+            return w
+    return 0.0
+
+
+def victim_factor(fallecidos: float, atrapamientos: float, rescatados: float) -> float:
+    """Graded, saturating victim severity in [0,1). Fatalities weigh most; the
+    curve rewards any casualty strongly without a hard batch-relative cap.
+    (heridos are not in tabla_integrada; atrapados/rescatados are the proxy.)"""
+    w = 3.0 * fallecidos + 2.0 * atrapamientos + 1.0 * rescatados
+    return 1.0 - VICTIM_DECAY ** w if w > 0 else 0.0
 
 
 def demolicion_value(v) -> float:
@@ -208,23 +276,27 @@ def f3_done_registros(df_f3_match: pd.DataFrame) -> set[str]:
 def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
                        zones: list[dict], ts_by_visita: dict[str, pd.Timestamp],
                        now: datetime, top: int = 100) -> pd.DataFrame:
+    """Persistent roster: every geolocated registro becomes a row tagged
+    `visitado` (already has an F3 in integracion_f3) or `pendiente`. Pendientes
+    are scored and only the top-N ranked ones are kept; visitados are all kept
+    so the dashboard shows visited-vs-pending progress. `done` = the F3 set."""
     if df_integrada.empty or "registro_id" not in df_integrada.columns:
-        return pd.DataFrame(columns=OUT_COLS)
-    pending = df_integrada[~df_integrada["registro_id"].astype(str).isin(done)].copy()
+        return pd.DataFrame(columns=OUT_COLS + WEB_EXTRA_COLS)
+    src_df = df_integrada.copy()
 
     # coords string column: the newer pipeline emits a single `coords`, the
     # older one `coords_unificadas`. Prefer whichever the sheet actually has.
     coords_col = next((c for c in ("coords_unificadas", "coords")
-                       if c in pending.columns), None)
+                       if c in src_df.columns), None)
 
     # lat/lon: explicit columns when present, else parsed from the coords string
     # (Cali-bbox guarded). reindex keeps a Series even if a column is absent, so
     # a schema that drops lat/lon degrades to the coords fallback, not a crash.
-    lat = pd.to_numeric(pending.reindex(columns=["lat"])["lat"], errors="coerce")
-    lon = pd.to_numeric(pending.reindex(columns=["lon"])["lon"], errors="coerce")
+    lat = pd.to_numeric(src_df.reindex(columns=["lat"])["lat"], errors="coerce")
+    lon = pd.to_numeric(src_df.reindex(columns=["lon"])["lon"], errors="coerce")
     if coords_col is not None:
         need = lat.isna() | lon.isna()
-        parsed = pending.loc[need, coords_col].map(parse_latlon)
+        parsed = src_df.loc[need, coords_col].map(parse_latlon)
         lat.loc[need] = parsed.map(lambda t: t[0] if t else float("nan"))
         lon.loc[need] = parsed.map(lambda t: t[1] if t else float("nan"))
 
@@ -242,7 +314,7 @@ def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
         return None
 
     rows = []
-    for i, (_, src) in enumerate(pending.iterrows()):
+    for i, (_, src) in enumerate(src_df.iterrows()):
         x, y = lon.iloc[i], lat.iloc[i]
         if pd.isna(x) or pd.isna(y):
             continue  # sin coordenadas no se puede despachar una cuadrilla
@@ -256,53 +328,74 @@ def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
         if age_days is None:
             flags.append("sin_timestamp")
 
-        victims = _num(src.get("n_fallecidos_total", "")) + _num(src.get("n_atrapamientos_total", ""))
+        fall = _num(src.get("n_fallecidos_total", ""))
+        atrap = _num(src.get("n_atrapamientos_total", ""))
+        resc = _num(src.get("n_rescatados_total", ""))
+        gsev = graph_severity(" ".join(str(src.get(c, "")) for c in DAMAGE_TEXT_COLS))
+        visitado = str(src.get("registro_id", "")).strip() in done
         rows.append({
+            "estado_visita": "visitado" if visitado else "pendiente",
             "id_asignacion": id_asignacion(src.get("registro_id", "")),
             "registro_id": src.get("registro_id", ""),
             "direccion": src.get("direccion_unificada", ""),
             "comuna_corregimiento": src.get("comuna_unificada", ""),
             "barrio_vereda": src.get("barrio_unificado", ""),
             "coords": src.get(coords_col, "") if coords_col else "",
+            "lat": round(float(y), 6),
+            "lon": round(float(x), 6),
             "zona_id": zone["zone_id"] if zone else "",
             "ola": zone["ola"] if zone else "",
             "despacho": zone["despacho"] if zone else "",
             "nivel_riesgo": src.get("nivel_riesgo", ""),
             "estado_estructura": src.get("estado_estructura", ""),
+            "grafo_severidad": round(gsev, 2),
+            "n_fallecidos": int(fall),
+            "n_atrapamientos": int(atrap),
+            "n_rescatados": int(resc),
             "requiere_demolicion": src.get("requiere_demolicion", ""),
             "antiguedad_dias": round(age_days, 1) if age_days is not None else "",
             "timestamp_registro": ts.strftime("%Y-%m-%d %H:%M") if ts is not None else "",
             "flags": ",".join(flags),
             "_age": age_days,
-            "_victims": victims,
+            "_gsev": gsev,
+            "_vfac": victim_factor(fall, atrap, resc),
         })
     out = pd.DataFrame(rows)
     if out.empty:
-        return pd.DataFrame(columns=OUT_COLS)
+        return pd.DataFrame(columns=OUT_COLS + WEB_EXTRA_COLS)
 
-    ages = out["_age"].dropna()
+    # Age is min-max normalized across pending points (the ones being ranked).
+    ages = out.loc[out["estado_visita"] == "pendiente", "_age"].dropna()
     lo, span = (ages.min(), ages.max() - ages.min()) if len(ages) else (0.0, 0.0)
 
     def score(r) -> float:
         age_norm = ((r["_age"] - lo) / span) if (pd.notna(r["_age"]) and span > 0) else 0.0
         return round(
-            WEIGHTS["antiguedad"] * age_norm
+            WEIGHTS["grafo_severidad"] * r["_gsev"]
+            + WEIGHTS["victimas"] * r["_vfac"]
+            + WEIGHTS["antiguedad"] * age_norm
             + WEIGHTS["nivel_riesgo"] * riesgo_value(r["nivel_riesgo"])
-            + WEIGHTS["estado_estructura"] * estado_value(r["estado_estructura"])
             + WEIGHTS["requiere_demolicion"] * demolicion_value(r["requiere_demolicion"])
-            + WEIGHTS["victimas"] * (1.0 if r["_victims"] > 0 else 0.0)
             + WEIGHTS["ola_zona"] * ola_value(r["ola"]), 1)
 
     out["score"] = out.apply(score, axis=1)
     out["_age_sort"] = out["_age"].fillna(-1.0)
-    out = (out.sort_values(["score", "_age_sort", "registro_id"],
-                           ascending=[False, False, True])
-              .head(top).reset_index(drop=True))
-    out.insert(0, "prioridad", out.index + 1)
-    out["fecha_corrida"] = now.strftime("%Y-%m-%d %H:%M")
     if out["id_asignacion"].duplicated().any():
         raise ValueError("id_asignacion collision detected; widen the id space.")
-    return out[OUT_COLS]
+
+    pend = (out[out["estado_visita"] == "pendiente"]
+            .sort_values(["score", "_age_sort", "registro_id"],
+                         ascending=[False, False, True])
+            .head(top).reset_index(drop=True))
+    pend["prioridad"] = pend.index + 1
+    vis = (out[out["estado_visita"] == "visitado"]
+           .sort_values(["score", "registro_id"], ascending=[False, True])
+           .reset_index(drop=True))
+    vis["prioridad"] = ""   # visited points are done, not part of the worklist order
+
+    roster = pd.concat([pend, vis], ignore_index=True)
+    roster["fecha_corrida"] = now.strftime("%Y-%m-%d %H:%M")
+    return roster[OUT_COLS + WEB_EXTRA_COLS]
 
 
 # ── Self-check ────────────────────────────────────────────────────────────────
@@ -348,6 +441,16 @@ def _selfcheck():
     assert zones[0]["geometry"]["type"] == "Polygon"
     assert zones[1]["geometry"]["type"] == "MultiPolygon"
 
+    # Graph severity: worst pathology's NSR-10/AIS peso wins; nothing -> 0.0.
+    assert graph_severity("Aplastamiento del concreto en columna") == 0.9
+    assert graph_severity("solo una fisura capilar") == 0.25
+    assert graph_severity("edificación en buen estado") == 0.0
+    assert graph_severity("") == 0.0
+    # Victims: any casualty > 0, fatalities weigh most, monotonic, saturating <1.
+    assert victim_factor(0, 0, 0) == 0.0
+    assert 0.0 < victim_factor(0, 0, 1) < victim_factor(0, 1, 0) < victim_factor(1, 0, 0) < 1.0
+    assert victim_factor(2, 0, 0) > victim_factor(1, 0, 0)
+
     df_match = pd.DataFrame({
         "registro_id": ["AAAA-1111-XYZ12", "BBBB-2222", "-CCC33"],
         "match_method": ["handshake", "", "solo_f3"],
@@ -366,25 +469,41 @@ def _selfcheck():
         "lon": ["-76.535", "-76.535", "-76.555", ""],
         "coords_unificadas": ["3.445, -76.535", "3.445, -76.535", "3.405, -76.555", ""],
         "nivel_riesgo": ["Alto", "Alto", "Bajo", ""],
-        "estado_estructura": ["Colapso Parcial", "Colapso Parcial", "", ""],
+        "estado_estructura": ["No Habitable", "No Habitable", "Habitable", ""],
+        "descripcion_edan": ["daño", "Aplastamiento del concreto", "fisura leve", ""],
+        "descripcion_visita": ["", "", "", ""],
+        "nombre_estructura": ["", "", "", ""],
         "requiere_demolicion": ["Sí", "Sí", "No", ""],
         "n_fallecidos_total": ["0", "1", "0", ""],
         "n_atrapamientos_total": ["0", "0", "0", ""],
+        "n_rescatados_total": ["0", "0", "0", ""],
     })
     ts = {"2222": pd.Timestamp(2026, 8, 11, 8, 0), "3333": pd.Timestamp(2026, 8, 15, 8, 0)}
     out = build_asignaciones(df_integrada, done, zones, ts, now, top=100)
 
-    assert "AAAA-1111" not in set(out["registro_id"])          # F3 done -> excluded
-    assert list(out.columns) == OUT_COLS
+    assert list(out.columns) == OUT_COLS + WEB_EXTRA_COLS
     assert out["registro_id"].is_unique
-    assert (out["score"].diff().dropna() <= 0).all()           # non-increasing
-    r_top = out.iloc[0]  # oldest + alto + colapso + demolicion + victima + OLA1
-    assert r_top["registro_id"] == "BBBB-2222" and r_top["zona_id"] == "C03-Z02"
-    assert r_top["ola"] == "1" and r_top["score"] == 100.0
-    r_mid = out[out["registro_id"] == "CCCC-3333"].iloc[0]     # in multipolygon zone
-    assert r_mid["zona_id"] == "C19-Z01" and r_mid["ola"] == "2"
     assert "DDDD-4444" not in set(out["registro_id"])          # sin coords -> excluded
-    assert len(out) == 2
+    assert len(out) == 3                                        # 2 pendientes + 1 visitado
+
+    visita = dict(zip(out["registro_id"], out["estado_visita"]))
+    assert visita == {"AAAA-1111": "visitado", "BBBB-2222": "pendiente",
+                      "CCCC-3333": "pendiente"}, visita
+
+    pend = out[out["estado_visita"] == "pendiente"].reset_index(drop=True)
+    assert list(pend["registro_id"]) == ["BBBB-2222", "CCCC-3333"]  # score desc
+    assert list(pend["prioridad"]) == [1, 2]
+    assert (pend["score"].diff().dropna() <= 0).all()          # non-increasing
+    r_top = pend.iloc[0]  # aplastamiento(0.9) + fatality + oldest + alto + demol + OLA1
+    assert r_top["zona_id"] == "C03-Z02" and r_top["ola"] == "1"
+    assert r_top["grafo_severidad"] == 0.9 and r_top["n_fallecidos"] == 1
+    r_mid = pend[pend["registro_id"] == "CCCC-3333"].iloc[0]   # in multipolygon zone
+    assert r_mid["zona_id"] == "C19-Z01" and r_mid["ola"] == "2"
+    assert r_mid["grafo_severidad"] == 0.25
+
+    vis = out[out["estado_visita"] == "visitado"]
+    assert (vis["prioridad"].astype(str) == "").all()          # visitados sin orden de worklist
+    assert pd.notna(out["lat"]).all() and pd.notna(out["lon"]).all()
     assert out["id_asignacion"].str.fullmatch(r"[0-9A-Z]{5}").all()
     assert out["id_asignacion"].is_unique
     out2 = build_asignaciones(df_integrada, done, zones, ts, now, top=100)
@@ -434,6 +553,30 @@ def _read_tab(gc, spreadsheet_id, tab) -> pd.DataFrame:
     return pd.DataFrame(data, columns=header)
 
 
+def export_web(out: pd.DataFrame, zones: list[dict], now: datetime) -> None:
+    """Best-effort static artifacts for the dashboard: web/data/asignaciones.json
+    (roster with lat/lon) + web/data/zonas_asignacion.geojson. Skipped silently
+    when web/data is absent (e.g. running inside the integration container)."""
+    web_data = REPO_ROOT / "web" / "data"
+    if not web_data.exists():
+        print(f"web/data ausente ({web_data}); no exporto al frontend")
+        return
+    records = out.where(out.notna(), None).to_dict(orient="records")
+    n_vis = int((out["estado_visita"] == "visitado").sum())
+    payload = {
+        "generated_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
+        "pendientes": int(len(out) - n_vis),
+        "visitados": n_vis,
+        "zonas": len(zones),
+        "records": records,
+    }
+    (web_data / "asignaciones.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    write_geojson(zones, web_data / "zonas_asignacion.geojson")
+    print(f"web export: {len(records)} filas -> web/data/asignaciones.json "
+          f"+ zonas_asignacion.geojson")
+
+
 def main() -> dict:
     if "--check" in sys.argv:
         _selfcheck()
@@ -459,18 +602,28 @@ def main() -> dict:
 
     now = datetime.now()
     out = build_asignaciones(df_integrada, done, zones, ts_by_visita, now, top=top)
-    n_zona = int(out["zona_id"].astype(str).str.strip().ne("").sum())
-    n_ts = int(out["antiguedad_dias"].astype(str).str.strip().ne("").sum())
-    score_max = float(out["score"].max()) if not out.empty else 0.0
-    score_min = float(out["score"].min()) if not out.empty else 0.0
-    print(f"asignaciones: {len(out)} puntos | con zona: {n_zona} | con antiguedad: {n_ts} "
-          f"| score max/min: {score_max}/{score_min}")
-    summary = {"puntos": len(out), "con_zona": n_zona, "con_antiguedad": n_ts,
+    n_vis = int((out["estado_visita"] == "visitado").sum()) if not out.empty else 0
+    n_pend = len(out) - n_vis
+    n_gsev = int((pd.to_numeric(out["grafo_severidad"], errors="coerce") > 0).sum()) if not out.empty else 0
+    n_victimas = int(((out["n_fallecidos"].astype(int) + out["n_atrapamientos"].astype(int)
+                       + out["n_rescatados"].astype(int)) > 0).sum()) if not out.empty else 0
+    pend_scores = pd.to_numeric(out.loc[out["estado_visita"] == "pendiente", "score"], errors="coerce")
+    score_max = float(pend_scores.max()) if len(pend_scores) else 0.0
+    score_min = float(pend_scores.min()) if len(pend_scores) else 0.0
+    print(f"asignaciones: {len(out)} filas | pendientes: {n_pend} | visitados: {n_vis} "
+          f"| con daño en grafo: {n_gsev} | con víctimas: {n_victimas} "
+          f"| score pendientes max/min: {score_max}/{score_min}")
+    summary = {"filas": len(out), "pendientes": n_pend, "visitados": n_vis,
+               "con_grafo": n_gsev, "con_victimas": n_victimas,
                "zonas_kml": len(zones), "registros_con_f3": len(done)}
 
+    # Static artifacts for the dashboard (roster with lat/lon + zones geojson).
+    export_web(out, zones, now)
+
+    sheet_out = out[OUT_COLS]
     if "--dry" in sys.argv:
         path = "output/asignaciones.xlsx"
-        out.to_excel(path, index=False)
+        sheet_out.to_excel(path, index=False)
         print(f"dry run: wrote {path} (no sheet write)")
         return summary
 
@@ -478,11 +631,11 @@ def main() -> dict:
     try:
         dst = ss.worksheet(DST_TAB)
     except gspread.WorksheetNotFound:
-        dst = ss.add_worksheet(DST_TAB, rows=top + 10, cols=len(OUT_COLS))
-    values = [OUT_COLS] + out.astype(str).where(out.notna(), "").values.tolist()
+        dst = ss.add_worksheet(DST_TAB, rows=len(sheet_out) + 10, cols=len(OUT_COLS))
+    values = [OUT_COLS] + sheet_out.astype(str).where(sheet_out.notna(), "").values.tolist()
     dst.clear()
     dst.update(values=values, range_name="A1", value_input_option="RAW")
-    print(f"wrote {len(out)} rows to {DST_TAB}")
+    print(f"wrote {len(sheet_out)} rows to {DST_TAB}")
     return summary
 
 
