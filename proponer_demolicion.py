@@ -84,6 +84,7 @@ TEXT_FIELDS = ("observaciones", "eval_estructural", "eval_otra",
 
 OUT_COLS = ["prioridad", "id_edan", "registro_id", "categoria", "score", "motivos",
             "hallazgos_texto",
+            "nombre_edificacion",
             "direccion", "direccion_norm", "barrio_vereda", "comuna", "coords",
             "n_pisos", "n_ocupantes", "criterio_habitabilidad",
             "estado_edificacion", "colapso_total", "colapso_parcial",
