@@ -47,9 +47,12 @@ def _client(project: str | None, sa: str | None):
     sa = sa or FIRESTORE_SA_FILE
     if sa:
         return firestore.Client.from_service_account_json(sa, project=project)
-    env = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if env:
-        return firestore.Client.from_service_account_info(json.loads(env), project=project)
+    # JSON entero por env (Railway/CI). Acepta varios nombres: el del proyecto usa
+    # GOOGLE_SERVICE_ACCOUNT_JSON_SA para la SA de dagma.
+    for var in ("GOOGLE_SERVICE_ACCOUNT_JSON_SA", "GOOGLE_SERVICE_ACCOUNT_JSON", "FIREBASE_SA_JSON"):
+        env = os.environ.get(var, "").strip()
+        if env:
+            return firestore.Client.from_service_account_info(json.loads(env), project=project)
     return firestore.Client(project=project)  # ADC (login por CLI o GOOGLE_APPLICATION_CREDENTIALS)
 
 
