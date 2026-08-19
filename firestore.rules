@@ -17,7 +17,7 @@ service cloud.firestore {
       allow update: if request.auth != null && request.auth.token.pmu == true
         && request.resource.data.diff(resource.data).affectedKeys()
              .hasOnly(['gestion_estado', 'gestion_asignado_a', 'gestion_nota',
-                       'gestion_despacho_id',
+                       'gestion_despacho_id', 'gestion_entidad', 'gestion_fecha',
                        'gestion_actualizado_utc', 'gestion_actualizado_por']);
       allow create, delete: if false;
     }
