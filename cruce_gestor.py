@@ -5,10 +5,18 @@ per-zone rollup of remaining work.
 
 Reads web/data/asignaciones.json (the roster asignar_f3.py exports) and the
 gestor's `zonas`, `evaluaciones`, `puntos` and `despachosHoy` endpoints. For
-each roster record, finds the nearest gestor `evaluaciones` row (an F3 visit
-already done) and the nearest gestor `puntos` row, both within 40 m
-(haversine). Writes web/data/cruce_gestor.json: a global resumen, a per-zone
-rollup (faltantes desc) and the enriched roster records.
+each roster record:
+
+- F3 match: nearest gestor `evaluaciones` row within 40 m (haversine); when
+  there is no geo match, falls back to normalized-address matching (IGAC
+  normalization, exact then fuzzy) against the evaluacion's DIRECCION.
+- Zone: assigned by point-in-polygon against each zona's POLIGONO (the
+  authoritative gestor geometry); the roster's zona_id is only a fallback for
+  records with no coordinates or outside every polygon.
+- Nearest gestor `puntos` row within 40 m (status only).
+
+Writes web/data/cruce_gestor.json: a global resumen, a per-zone rollup
+(faltantes desc) and the enriched roster records.
 
     python cruce_gestor.py --check   # offline self-check, no network
     python cruce_gestor.py           # real data, write web/data/cruce_gestor.json
@@ -19,15 +27,18 @@ import json
 import sys
 import time
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import requests
 
 from integracion.coords import haversine_m
+from integracion.normalization import normalize_address
 
 BASE_URL = ("https://script.google.com/macros/s/"
             "AKfycbw4uRh_HkiZtKgvb1ZkGYt_m5wydNFWw1SkN6D2ttGEaLm_V4cHOJCqg5I581hqevuP/exec")
 MAX_MATCH_M = 40.0
+ADDR_MATCH_RATIO = 0.90
 PENDING_STATES = {"PENDIENTE", "EN_ATENCION"}
 
 HERE = Path(__file__).resolve().parent
@@ -87,21 +98,106 @@ def _punto_latlon(p: dict):
     return (lat, lon) if lat is not None and lon is not None else None
 
 
-def cruce_f3(lat, lon, evaluaciones: list[dict]) -> dict:
-    """Nearest F3 visit already done within 40 m; f3_hecha=False when none."""
+def addr_key(direccion) -> str:
+    """Comparable address key: IGAC-normalized nomenclature, complement (after
+    the first comma: barrio/ciudad suffixes) dropped, uppercased."""
+    return normalize_address(direccion).split(",")[0].strip().upper()
+
+
+def build_addr_index(evaluaciones: list[dict]) -> list[tuple[str, dict]]:
+    """(addr_key, evaluacion) pairs for every evaluacion with a usable DIRECCION."""
+    out = []
+    for e in evaluaciones:
+        k = addr_key(e.get("DIRECCION"))
+        if k:
+            out.append((k, e))
+    return out
+
+
+def match_by_direccion(direccion, addr_index: list[tuple[str, dict]]):
+    """Evaluacion whose normalized address equals — or fuzzily matches
+    (ratio >= ADDR_MATCH_RATIO) — the record's. None when no confident match."""
+    key = addr_key(direccion)
+    if not key:
+        return None
+    best, best_ratio = None, ADDR_MATCH_RATIO
+    # ponytail: O(roster_sin_geo × evaluaciones) SequenceMatcher scan; index by
+    # via+numero if it ever gets slow.
+    for k, e in addr_index:
+        if k == key:
+            return e
+        ratio = SequenceMatcher(None, key, k).ratio()
+        if ratio >= best_ratio:
+            best, best_ratio = e, ratio
+    return best
+
+
+def cruce_f3(lat, lon, direccion, evaluaciones: list[dict],
+             addr_index: list[tuple[str, dict]]) -> dict:
+    """F3 visit already done: nearest within 40 m, or (fallback) same
+    normalized address. f3_match_via says which criterion matched."""
     best, dist = nearest(lat, lon, evaluaciones, _eval_latlon)
+    via = "geo" if best is not None else None
+    if best is None:
+        best = match_by_direccion(direccion, addr_index)
+        via = "direccion" if best is not None else None
     if best is None:
         return {"f3_hecha": False, "f3_global_id": None, "f3_fecha": None,
-                "f3_severidad": None, "f3_habitabilidad": None, "f3_dist_m": None}
+                "f3_severidad": None, "f3_habitabilidad": None, "f3_dist_m": None,
+                "f3_match_via": None}
     return {"f3_hecha": True, "f3_global_id": best.get("GLOBAL_ID"),
             "f3_fecha": best.get("FECHA_INSPECCION"), "f3_severidad": best.get("SEVERIDAD"),
-            "f3_habitabilidad": best.get("HABITABILIDAD"), "f3_dist_m": round(dist, 1)}
+            "f3_habitabilidad": best.get("HABITABILIDAD"),
+            "f3_dist_m": round(dist, 1) if dist is not None else None,
+            "f3_match_via": via}
 
 
 def cruce_punto(lat, lon, puntos: list[dict]) -> dict:
     """Nearest gestor `puntos` entry within 40 m (its status)."""
     best, _ = nearest(lat, lon, puntos, _punto_latlon)
     return {"punto_estado": best.get("ESTADO") if best else None}
+
+
+# ── Zone by polygon ─────────────────────────────────────────────────────────
+def _zona_poly(z: dict):
+    """POLIGONO as [[lat, lon], ...], parsed from JSON string or passed-through
+    list. None when absent/malformed."""
+    raw = z.get("POLIGONO")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    if not isinstance(raw, list) or len(raw) < 3:
+        return None
+    return raw
+
+
+def point_in_poly(lat, lon, poly) -> bool:
+    """Ray casting over [[lat, lon], ...] vertices."""
+    inside = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        yi, xi = poly[i][0], poly[i][1]
+        yj, xj = poly[j][0], poly[j][1]
+        if (yi > lat) != (yj > lat) and lon < (xj - xi) * (lat - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def build_zona_polys(zonas: list[dict]) -> list[tuple[str, list]]:
+    return [(z["ZONA_ID"], poly) for z in zonas
+            if z.get("ZONA_ID") and (poly := _zona_poly(z)) is not None]
+
+
+def zona_por_poligono(lat, lon, zona_polys: list[tuple[str, list]]) -> str | None:
+    if lat is None or lon is None:
+        return None
+    for zid, poly in zona_polys:
+        if point_in_poly(lat, lon, poly):
+            return zid
+    return None
 
 
 # ── Zone rollup ─────────────────────────────────────────────────────────────
@@ -164,18 +260,24 @@ def build_zona_rollups(zonas: list[dict], enriched: list[dict],
 
 def build_cruce(roster_records: list[dict], zonas: list[dict], evaluaciones: list[dict],
                 puntos: list[dict], despachos_hoy: list[dict], now: datetime) -> dict:
+    addr_index = build_addr_index(evaluaciones)
+    zona_polys = build_zona_polys(zonas)
     enriched = []
     for r in roster_records:
         lat, lon = _num(r.get("lat")), _num(r.get("lon"))
+        # Zona por POLÍGONO del gestor (autoritativa); el zona_id del roster es
+        # solo fallback (sin coords o fuera de todo polígono).
+        zid_poly = zona_por_poligono(lat, lon, zona_polys)
         row = {
             "registro_id": r.get("registro_id"),
             "lat": lat, "lon": lon,
             "direccion": r.get("direccion"),
-            "zona_id": r.get("zona_id"),
+            "zona_id": zid_poly or r.get("zona_id"),
+            "zona_via": "poligono" if zid_poly else ("roster" if r.get("zona_id") else None),
             "estado_visita": r.get("estado_visita"),
             "score": r.get("score"),
         }
-        row.update(cruce_f3(lat, lon, evaluaciones))
+        row.update(cruce_f3(lat, lon, r.get("direccion"), evaluaciones, addr_index))
         row.update(cruce_punto(lat, lon, puntos))
         enriched.append(row)
 
@@ -187,6 +289,8 @@ def build_cruce(roster_records: list[dict], zonas: list[dict], evaluaciones: lis
     resumen = {
         "total_criticos": len(enriched),
         "f3_hechas": n_f3,
+        "f3_por_direccion": sum(1 for r in enriched if r.get("f3_match_via") == "direccion"),
+        "zona_por_poligono": sum(1 for r in enriched if r.get("zona_via") == "poligono"),
         "f3_faltantes": len(enriched) - n_f3,
         "gestor_puntos_totales": len(puntos),
         "gestor_puntos_pendientes": gestor_pend,
@@ -199,21 +303,25 @@ def build_cruce(roster_records: list[dict], zonas: list[dict], evaluaciones: lis
 
 # ── Self-check ────────────────────────────────────────────────────────────────
 def _selfcheck():
+    z1_poly = "[[3.42, -76.54], [3.44, -76.54], [3.44, -76.52], [3.42, -76.52]]"
     zonas = [{"ZONA_ID": "Z1", "COMUNA": "Comuna 1", "LIDER_ACTUAL": "Ana",
-              "ESTADO_ACTUAL": "ASIGNADA", "N_PUNTOS": 5}]
+              "ESTADO_ACTUAL": "ASIGNADA", "N_PUNTOS": 5, "POLIGONO": z1_poly}]
     despachos_hoy = [{"ZONA_ID": "Z1"}]
     evaluaciones = [{"GLOBAL_ID": "E1", "FECHA_INSPECCION": "2026-08-10", "X": -76.5300,
-                     "Y": 3.4300, "SEVERIDAD": "bajo", "HABITABILIDAD": "h"}]
+                     "Y": 3.4300, "SEVERIDAD": "bajo", "HABITABILIDAD": "h",
+                     "DIRECCION": "Calle 1 # 2-3"}]
     puntos = [{"ZONA_ID": "Z1", "ESTADO": "PENDIENTE", "LAT": 3.5000, "LON": -76.6000}]
     roster = [
         {"registro_id": "R1", "lat": 3.4300, "lon": -76.5300, "direccion": "CL 1",
-         "zona_id": "Z1", "estado_visita": "pendiente", "score": 80.0},   # same point as evaluacion -> hecha
+         "zona_id": "", "estado_visita": "pendiente", "score": 80.0},     # same point as evaluacion -> hecha (geo); dentro del polígono Z1
         {"registro_id": "R2", "lat": 3.0000, "lon": -76.0000, "direccion": "CL 2",
-         "zona_id": "Z1", "estado_visita": "pendiente", "score": 60.0},   # far -> not hecha
+         "zona_id": "Z1", "estado_visita": "pendiente", "score": 60.0},   # far, address distinta -> not hecha; zona por roster
         {"registro_id": "R4", "lat": 3.1000, "lon": -76.1000, "direccion": "CL 4",
          "zona_id": "", "estado_visita": "pendiente", "score": 40.0},     # blank zona_id -> fuera de zona
         {"registro_id": "R5", "lat": 3.2000, "lon": -76.2000, "direccion": "CL 5",
          "zona_id": "Z9", "estado_visita": "pendiente", "score": 30.0},   # unmatched zona_id -> fuera de zona
+        {"registro_id": "R6", "lat": 3.3000, "lon": -76.3000, "direccion": "Calle 1 No. 2-3, Cali",
+         "zona_id": "", "estado_visita": "pendiente", "score": 20.0},     # far pero misma dirección normalizada -> hecha (direccion)
     ]
 
     # nearest(): boundary sanity — same-point match, far-point no-match.
@@ -222,13 +330,23 @@ def _selfcheck():
     best2, dist2 = nearest(3.0000, -76.0000, evaluaciones, _eval_latlon)
     assert best2 is None and dist2 is None
 
+    # Address key + polygon sanity.
+    assert addr_key("Calle 1 No. 2-3, Cali") == addr_key("CL 1 # 2-3") == "CL 1 # 2-3"
+    poly = _zona_poly(zonas[0])
+    assert point_in_poly(3.43, -76.53, poly) is True
+    assert point_in_poly(3.00, -76.00, poly) is False
+
     now = datetime(2026, 8, 18, 12, 0)
     out = build_cruce(roster, zonas, evaluaciones, puntos, despachos_hoy, now)
 
     recs = {r["registro_id"]: r for r in out["records"]}
     assert recs["R1"]["f3_hecha"] is True and recs["R1"]["f3_global_id"] == "E1"
-    assert recs["R1"]["f3_dist_m"] < 1.0
+    assert recs["R1"]["f3_dist_m"] < 1.0 and recs["R1"]["f3_match_via"] == "geo"
+    assert recs["R1"]["zona_id"] == "Z1" and recs["R1"]["zona_via"] == "poligono"  # roster venía vacío
     assert recs["R2"]["f3_hecha"] is False and recs["R2"]["f3_global_id"] is None
+    assert recs["R2"]["zona_id"] == "Z1" and recs["R2"]["zona_via"] == "roster"    # fuera del polígono
+    assert recs["R6"]["f3_hecha"] is True and recs["R6"]["f3_match_via"] == "direccion"
+    assert recs["R6"]["f3_global_id"] == "E1" and recs["R6"]["f3_dist_m"] is None
     assert recs["R1"]["punto_estado"] is None  # nearest punto (Z1) is >40m from R1
 
     assert len(out["zonas"]) == 2  # Z1 + the synthetic "(fuera de zona)" row
@@ -236,13 +354,14 @@ def _selfcheck():
     assert by_id["Z1"] == {"zona_id": "Z1", "comuna": "Comuna 1", "lider": "Ana", "estado_zona": "ASIGNADA",
                            "despacho_hoy": True, "n_criticos": 2, "n_f3_hechas": 1, "n_faltantes": 1,
                            "gestor_n_puntos": 5, "gestor_pendientes": 1}, by_id["Z1"]
-    fuera = by_id[FUERA_DE_ZONA]  # R4 (blank zona_id) + R5 (unmatched "Z9"), neither has an F3
+    fuera = by_id[FUERA_DE_ZONA]  # R4 (blank) + R5 ("Z9") + R6 (blank, F3 por dirección)
     assert fuera == {"zona_id": FUERA_DE_ZONA, "comuna": "", "lider": "", "estado_zona": "",
-                     "despacho_hoy": False, "n_criticos": 2, "n_f3_hechas": 0, "n_faltantes": 2,
+                     "despacho_hoy": False, "n_criticos": 3, "n_f3_hechas": 1, "n_faltantes": 2,
                      "gestor_n_puntos": 0, "gestor_pendientes": 0}, fuera
 
     r = out["resumen"]
-    assert r["total_criticos"] == 4 and r["f3_hechas"] == 1 and r["f3_faltantes"] == 3
+    assert r["total_criticos"] == 5 and r["f3_hechas"] == 2 and r["f3_faltantes"] == 3
+    assert r["f3_por_direccion"] == 1 and r["zona_por_poligono"] == 1
     assert r["gestor_puntos_totales"] == 1 and r["gestor_puntos_pendientes"] == 1
     assert r["zonas_con_despacho_hoy"] == 1
     # Table (zonas rollup) reconciles with the summary card.
@@ -254,6 +373,7 @@ def _selfcheck():
            "estado_visita": "pendiente", "score": 0}
     out2 = build_cruce([row], zonas, evaluaciones, puntos, despachos_hoy, now)
     assert out2["records"][0]["f3_hecha"] is False
+    assert out2["records"][0]["zona_via"] == "roster"
     print("selfcheck ok")
 
 
