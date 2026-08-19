@@ -240,16 +240,24 @@ def main() -> None:
     if not criticos:
         raise RuntimeError("la API devolvio 0 criticos; abortando (no sobrescribo el cruce).")
     zone_for, zone_feats = load_zone_lookup()
-    # Las zonas del dashboard salen de la MISMA base KML que usa el cruce.
-    if zone_feats:
-        write_geojson(zone_feats, ZONES_GEOJSON)
     out = build_cruce(criticos, survey, zone_for)
-    OUT_JSON.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    # Artefactos LOCALES (web/data del repo dashboard): opcionales. En Railway el
+    # contenedor solo tiene /app y REPO_ROOT apunta a /; ahi el destino real es
+    # Firestore, asi que un fallo de disco no debe tumbar la corrida.
+    try:
+        if zone_feats:
+            ZONES_GEOJSON.parent.mkdir(parents=True, exist_ok=True)
+            write_geojson(zone_feats, ZONES_GEOJSON)
+        OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+        OUT_JSON.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+        destino_local = str(OUT_JSON)
+    except OSError as exc:
+        destino_local = f"(sin artefactos locales: {exc})"
     r = out["resumen"]
     print(f"cruce: {r['total_criticos']} criticos | levantados {r['levantados']} "
           f"(globalid {r['por_globalid']} + cercania {r['por_cercania']}) | "
           f"pendientes {r['pendientes']} | survey {r['survey_usados']}/{r['survey_puntos']} usados")
-    print(f"-> {OUT_JSON} | zonas KML: {len(zone_feats)} -> {ZONES_GEOJSON.name}")
+    print(f"-> {destino_local} | zonas KML: {len(zone_feats)} -> {ZONES_GEOJSON.name}")
     if "--firebase" in sys.argv:
         import subir_cruce_firebase as fb
         fb.upload(out, fb.FIRESTORE_PROJECT, fb.COLLECTION, None)  # SA desde config/.env
