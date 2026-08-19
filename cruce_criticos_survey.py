@@ -14,7 +14,10 @@ corridas. Bucketiza por sector con la misma logica de zonas KML de asignar_f3.
 Cascada de match, radio MATCH_MAX_M sobre coords corregidas:
   1. globalid  -> placeId 'arcgis:<globalid>' del critico == GlobalID del survey
   2. cercania  -> survey mas cercano dentro de MATCH_MAX_M (haversine)
-  3. miss      -> sin EDE -> pendiente
+  3. direccion -> direccion normalizada IGAC igual (exacta o difflib >= 0.90)
+  4. combinado -> distancia y direccion apuntan al MISMO survey: prefijo (barrio
+                  pegado sin coma, <= 150 m) o casi-match (ratio >= 0.85, <= 60 m)
+  5. miss      -> sin EDE -> pendiente
 
 Uso:
     python cruce_criticos_survey.py --check      # self-check offline, sin red
@@ -25,14 +28,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 
+from difflib import SequenceMatcher
+
 from integracion import api_visitados
 from integracion.coords import haversine_m, parse_latlon
+# Mismos umbrales y llave de direccion que el cruce contra el Gestor de Zonas.
+from cruce_gestor import ADDR_MATCH_RATIO, COMBO_MAX_M, COMBO_RATIO, PREFIX_MAX_M, addr_key
 # Reusamos las piezas puras de asignar_f3: llave de integracion, normalizacion de
 # globalid y las zonas KML (misma logica de sectores del "app script").
 from asignar_f3 import id_asignacion, _norm_globalid, parse_zonas_kml, resolve_kml, write_geojson
@@ -75,19 +83,66 @@ def load_survey(path: Path = INSPECTIONS_JSON) -> list[dict]:
         lat, lon = r.get("y"), r.get("x")
         if lat in (None, "") or lon in (None, ""):
             continue
+        direccion = r.get("direccion_norm") or r.get("direccion")
         out.append({
             "globalid": _norm_globalid(r.get("GlobalID")),
             "lat": float(lat), "lon": float(lon),
-            "direccion": r.get("direccion_norm") or r.get("direccion"),
+            "direccion": direccion,
+            "akey": addr_key(direccion),
             "fecha": r.get("fecha_inspeccion"),
             "evaluador": r.get("nombre_evaluador"),
         })
     return out
 
 
-def match_survey(place_id, lat, lon, survey: list[dict],
+def _match_direccion(direccion, lat, lon, survey: list[dict]):
+    """Match por direccion normalizada: (survey, via) o (None, None). Las reglas
+    no-exactas exigen que distancia y direccion apunten al MISMO survey, o
+    direcciones casi iguales en otra parte de la ciudad dan falso positivo."""
+    key = addr_key(direccion)
+    if not key:
+        return None, None
+    for s in survey:
+        if s.get("akey") == key:
+            return s, "direccion"
+
+    def dist(s):
+        if lat is None or lon is None:
+            return None
+        return haversine_m((lat, lon), (s["lat"], s["lon"]))
+
+    best, best_key, best_ratio = None, "", 0.0
+    # ponytail: O(pendientes × survey) SequenceMatcher scan; indexar por via si
+    # alguna vez se hace lento.
+    for s in survey:
+        k = s.get("akey")
+        if not k:
+            continue
+        if len(key) >= 8 and len(k) >= 8 and (k.startswith(key) or key.startswith(k)):
+            d = dist(s)
+            if d is not None and d <= PREFIX_MAX_M:
+                return s, "combinado"
+        ratio = SequenceMatcher(None, key, k).ratio()
+        if ratio > best_ratio:
+            best, best_key, best_ratio = s, k, ratio
+    if best is not None and best_ratio >= ADDR_MATCH_RATIO:
+        # Fuzzy no-exacto: mismos dígitos (solo cambia formato/letras) o el
+        # mismo survey cerca — una placa distinta con ratio alto no es match.
+        d = dist(best)
+        if (re.sub(r"\D", "", key) == re.sub(r"\D", "", best_key)
+                or (d is not None and d <= PREFIX_MAX_M)):
+            return best, "direccion"
+    if best is not None and best_ratio >= COMBO_RATIO:
+        d = dist(best)
+        if d is not None and d <= COMBO_MAX_M:
+            return best, "combinado"
+    return None, None
+
+
+def match_survey(place_id, lat, lon, direccion, survey: list[dict],
                  by_gid: dict[str, dict]) -> dict:
-    """Cascada de match de un critico: globalid -> cercania (<=MATCH_MAX_M) -> miss."""
+    """Cascada de match de un critico:
+    globalid -> cercania (<=MATCH_MAX_M) -> direccion/combinado -> miss."""
     pid = str(place_id or "")
     if pid.startswith("arcgis:"):
         hit = by_gid.get(_norm_globalid(pid[len("arcgis:"):]))
@@ -105,6 +160,14 @@ def match_survey(place_id, lat, lon, survey: list[dict],
         return {"estado": "levantado", "match": "cercania",
                 "survey_globalid": best["globalid"], "dist_m": round(best_d),
                 "survey_fecha": best["fecha"], "survey_evaluador": best["evaluador"]}
+    hit, via = _match_direccion(direccion, lat, lon, survey)
+    if hit is not None:
+        d = (haversine_m((lat, lon), (hit["lat"], hit["lon"]))
+             if lat is not None and lon is not None else None)
+        return {"estado": "levantado", "match": via,
+                "survey_globalid": hit["globalid"],
+                "dist_m": round(d) if d is not None else None,
+                "survey_fecha": hit["fecha"], "survey_evaluador": hit["evaluador"]}
     return {"estado": "pendiente", "match": None, "survey_globalid": None,
             "dist_m": None, "survey_fecha": None, "survey_evaluador": None}
 
@@ -145,7 +208,7 @@ def build_cruce(criticos, survey: list[dict], zone_for) -> dict:
         rid = str(c.get("registro_id") or "").strip()
         latlon = parse_latlon(c.get("coords_unificadas"))
         lat, lon = (latlon if latlon else (None, None))
-        m = match_survey(c.get("sitio_id"), lat, lon, survey, by_gid)
+        m = match_survey(c.get("sitio_id"), lat, lon, c.get("direccion_unificada"), survey, by_gid)
         z = zone_for(lon, lat) or {}
         zid = z.get("zone_id") or ""
         rec = {
@@ -192,6 +255,8 @@ def build_cruce(criticos, survey: list[dict], zone_for) -> dict:
         "pendientes": len(records) - levantados,
         "por_globalid": sum(1 for r in records if r["match"] == "globalid"),
         "por_cercania": sum(1 for r in records if r["match"] == "cercania"),
+        "por_direccion": sum(1 for r in records if r["match"] == "direccion"),
+        "por_combinado": sum(1 for r in records if r["match"] == "combinado"),
         "survey_puntos": len(survey),
         "survey_usados": len({r["survey_globalid"] for r in records if r["survey_globalid"]}),
     }
@@ -208,23 +273,36 @@ def selfcheck() -> None:
     """Offline: valida la cascada de match sin red ni archivos."""
     survey = [
         {"globalid": "aaa", "lat": 3.4200, "lon": -76.5300,
-         "direccion": "cll 1", "fecha": "2026-08-11", "evaluador": "X"},
+         "direccion": "Calle 1 # 2-3", "akey": addr_key("Calle 1 # 2-3"),
+         "fecha": "2026-08-11", "evaluador": "X"},
         {"globalid": "bbb", "lat": 3.4500, "lon": -76.5600,
-         "direccion": "cll 2", "fecha": "2026-08-12", "evaluador": "Y"},
+         "direccion": "Carrera 9 # 8-7", "akey": addr_key("Carrera 9 # 8-7"),
+         "fecha": "2026-08-12", "evaluador": "Y"},
     ]
     by_gid = {s["globalid"]: s for s in survey}
     # 1. globalid exacto
-    r = match_survey("arcgis:{AAA}", 3.9, -76.9, survey, by_gid)
+    r = match_survey("arcgis:{AAA}", 3.9, -76.9, "", survey, by_gid)
     assert r["estado"] == "levantado" and r["match"] == "globalid", r
     # 2. cercania: ~11 m del punto aaa
-    r = match_survey("ChIJx", 3.42010, -76.53000, survey, by_gid)
+    r = match_survey("ChIJx", 3.42010, -76.53000, "", survey, by_gid)
     assert r["estado"] == "levantado" and r["match"] == "cercania", r
     assert r["dist_m"] <= MATCH_MAX_M, r
-    # 3. miss: lejos de todo
-    r = match_survey("ChIJx", 3.4200, -76.5000, survey, by_gid)
+    # 3. direccion exacta normalizada, lejos de todo -> levantado igual
+    r = match_survey("ChIJx", 3.9, -76.9, "CL 1 No. 2-3, Cali", survey, by_gid)
+    assert r["estado"] == "levantado" and r["match"] == "direccion", r
+    assert r["survey_globalid"] == "aaa", r
+    # 4. combinado: barrio pegado sin coma + mismo survey a ~100 m
+    r = match_survey("ChIJx", 3.4209, -76.5300, "CL 1 # 2-3 BARRIO CENTRO", survey, by_gid)
+    assert r["estado"] == "levantado" and r["match"] == "combinado", r
+    assert r["survey_globalid"] == "aaa" and 50 < r["dist_m"] < 150, r
+    # 5. direccion parecida pero lejos -> NO matchea (evidencia en conflicto)
+    r = match_survey("ChIJx", 3.9, -76.9, "CL 1 # 2-8", survey, by_gid)
     assert r["estado"] == "pendiente" and r["match"] is None, r
-    # 4. sin coords -> pendiente, no revienta
-    r = match_survey("", None, None, survey, by_gid)
+    # 6. miss: lejos de todo, direccion distinta
+    r = match_survey("ChIJx", 3.4200, -76.5000, "DG 99 # 1-1", survey, by_gid)
+    assert r["estado"] == "pendiente" and r["match"] is None, r
+    # 7. sin coords ni direccion -> pendiente, no revienta
+    r = match_survey("", None, None, "", survey, by_gid)
     assert r["estado"] == "pendiente", r
     print("cruce_criticos_survey self-check OK")
 
@@ -255,7 +333,8 @@ def main() -> None:
         destino_local = f"(sin artefactos locales: {exc})"
     r = out["resumen"]
     print(f"cruce: {r['total_criticos']} criticos | levantados {r['levantados']} "
-          f"(globalid {r['por_globalid']} + cercania {r['por_cercania']}) | "
+          f"(globalid {r['por_globalid']} + cercania {r['por_cercania']} + "
+          f"direccion {r['por_direccion']} + combinado {r['por_combinado']}) | "
           f"pendientes {r['pendientes']} | survey {r['survey_usados']}/{r['survey_puntos']} usados")
     print(f"-> {destino_local} | zonas KML: {len(zone_feats)} -> {ZONES_GEOJSON.name}")
     if "--firebase" in sys.argv:

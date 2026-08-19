@@ -157,7 +157,7 @@ def match_by_direccion(lat, lon, direccion, addr_index: list[tuple[str, dict]]):
     for k, e in addr_index:
         if k == key:
             return e, "direccion", _dist_to(lat, lon, e)
-    best, best_ratio = None, 0.0
+    best, best_key, best_ratio = None, "", 0.0
     # ponytail: O(roster_sin_geo × evaluaciones) SequenceMatcher scan; index by
     # via+numero if it ever gets slow.
     for k, e in addr_index:
@@ -167,9 +167,14 @@ def match_by_direccion(lat, lon, direccion, addr_index: list[tuple[str, dict]]):
                 return e, "combinado", d
         ratio = SequenceMatcher(None, key, k).ratio()
         if ratio > best_ratio:
-            best, best_ratio = e, ratio
+            best, best_key, best_ratio = e, k, ratio
     if best is not None and best_ratio >= ADDR_MATCH_RATIO:
-        return best, "direccion", _dist_to(lat, lon, best)
+        # Fuzzy no-exacto: mismos dígitos (solo cambia formato/letras) o la
+        # misma evaluación cerca — una placa distinta con ratio alto no es match.
+        d = _dist_to(lat, lon, best)
+        if (_re.sub(r"\D", "", key) == _re.sub(r"\D", "", best_key)
+                or (d is not None and d <= PREFIX_MAX_M)):
+            return best, "direccion", d
     if best is not None and best_ratio >= COMBO_RATIO:
         d = _dist_to(lat, lon, best)
         if d is not None and d <= COMBO_MAX_M:
