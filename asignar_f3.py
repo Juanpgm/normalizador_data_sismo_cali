@@ -37,13 +37,14 @@ from xml.etree import ElementTree
 
 import gspread
 import pandas as pd
+import requests
 from shapely.geometry import Point, shape
 from shapely.strtree import STRtree
 
 from integracion import api_visitados
 from integracion.config import (BOGOTA_TZ, VISITAS_SHEET_NAME,
                                 VISITAS_SPREADSHEET_ID)
-from integracion.coords import parse_latlon
+from integracion.coords import haversine_m, parse_latlon
 from integracion.gauth import credentials
 
 F3_SPREADSHEET_ID = "19k--nAEScol_3E7nbSpPev07gW2_UT8ojSsaMGbn6Ds"
@@ -98,9 +99,17 @@ OUT_COLS = ["prioridad", "estado_visita", "id_asignacion", "score", "registro_id
             "grafo_severidad", "n_fallecidos", "n_atrapamientos", "n_rescatados",
             "requiere_demolicion", "antiguedad_dias", "timestamp_registro",
             "flags", "fecha_corrida"]
-# Extra columns kept on the frame for the web export (lat/lon to plot points);
-# not written to the Google Sheet, which uses OUT_COLS only.
-WEB_EXTRA_COLS = ["lat", "lon"]
+# Extra columns kept on the frame for the web export (lat/lon to plot points,
+# ede_* for the EDE cross-reference); not written to the Google Sheet, which
+# uses OUT_COLS only.
+WEB_EXTRA_COLS = ["lat", "lon", "ede_hecha", "ede_match", "ede_fecha", "ede_dist_m"]
+
+# Public ArcGIS Survey123 feature layer "Matriz EDE" (EDE_v1): one point per
+# EDE field survey. No token needed; paginated via resultOffset.
+EDE_LAYER_URL = ("https://services6.arcgis.com/EF6OTqvE0RxR2jwj/arcgis/rest/services/"
+                 "service_d108cb3c79e242eabe99b458798936d1/FeatureServer/0")
+EDE_PAGE_SIZE = 1000
+EDE_MAX_MATCH_M = 40.0  # same proximity threshold as cruce_gestor
 
 
 # ── KML zones ─────────────────────────────────────────────────────────────────
@@ -276,6 +285,85 @@ def normalize_comuna(v) -> str:
     return f"Comuna {int(m.group(1))}" if m else s
 
 
+# ── EDE Survey123 cross-reference ─────────────────────────────────────────────
+def _norm_globalid(gid) -> str:
+    """ArcGIS sometimes returns '{UPPER-GUID}'; compare braceless lowercase."""
+    return str(gid or "").strip().strip("{}").lower()
+
+
+def _ede_fecha(ms) -> str | None:
+    """Unix-ms inspection date -> 'YYYY-MM-DD' in Bogota local; None on junk."""
+    try:
+        return (pd.Timestamp(int(ms), unit="ms", tz="UTC")
+                .tz_convert(BOGOTA_TZ).strftime("%Y-%m-%d"))
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_ede() -> list[dict]:
+    """All EDE survey points from the public feature layer, paginated. Each
+    item: normalized globalid, WGS84 lat/lon, fecha_inspeccion already as
+    'YYYY-MM-DD' Bogota-local, nombre_evaluador."""
+    out: list[dict] = []
+    offset = 0
+    while True:
+        resp = requests.get(f"{EDE_LAYER_URL}/query", params={
+            "where": "1=1",
+            # Deterministic order: offset pagination can skip/duplicate rows
+            # if the server returns pages in an unstable order.
+            "orderByFields": "objectid ASC",
+            "outFields": "globalid,fecha_inspeccion,nombre_evaluador",
+            "returnGeometry": "true", "outSR": 4326, "f": "json",
+            "resultOffset": offset, "resultRecordCount": EDE_PAGE_SIZE,
+        }, timeout=60)
+        resp.raise_for_status()
+        payload = resp.json()
+        if "error" in payload:  # ArcGIS reports errors inside a 200 body
+            raise RuntimeError(f"EDE layer error: {payload['error']}")
+        feats = payload.get("features", [])
+        for f in feats:
+            attrs = f.get("attributes") or {}
+            geom = f.get("geometry") or {}
+            out.append({
+                "globalid": _norm_globalid(attrs.get("globalid")),
+                "lat": geom.get("y"), "lon": geom.get("x"),
+                "fecha_inspeccion": _ede_fecha(attrs.get("fecha_inspeccion")),
+                "nombre_evaluador": attrs.get("nombre_evaluador"),
+            })
+        offset += len(feats)
+        if not feats or not payload.get("exceededTransferLimit"):
+            return out
+
+
+def match_ede(place_id, lat, lon, ede: list[dict] | None,
+              ede_by_gid: dict[str, dict]) -> dict:
+    """EDE cascade for one roster point: (1) API placeId 'arcgis:<globalid>'
+    found in the layer -> 'globalid'; (2) nearest EDE point within 40 m ->
+    'cercania'; (3) none -> ede_hecha=False. `ede=None` (fetch failed) ->
+    ede_hecha=None: unknown, which the UI must not render as 'no EDE'."""
+    if ede is None:
+        return {"ede_hecha": None, "ede_match": None, "ede_fecha": None,
+                "ede_dist_m": None}
+    pid = str(place_id or "")
+    if pid.startswith("arcgis:"):
+        hit = ede_by_gid.get(_norm_globalid(pid[len("arcgis:"):]))
+        if hit is not None:
+            return {"ede_hecha": True, "ede_match": "globalid",
+                    "ede_fecha": hit["fecha_inspeccion"], "ede_dist_m": None}
+    best, best_d = None, None
+    for e in ede:
+        if e["lat"] is None or e["lon"] is None:
+            continue
+        d = haversine_m((lat, lon), (e["lat"], e["lon"]))
+        if d <= EDE_MAX_MATCH_M and (best_d is None or d < best_d):
+            best, best_d = e, d
+    if best is not None:
+        return {"ede_hecha": True, "ede_match": "cercania",
+                "ede_fecha": best["fecha_inspeccion"], "ede_dist_m": round(best_d)}
+    return {"ede_hecha": False, "ede_match": None, "ede_fecha": None,
+            "ede_dist_m": None}
+
+
 # ── Core build ────────────────────────────────────────────────────────────────
 def f3_done_registros(df_f3_match: pd.DataFrame) -> set[str]:
     """registro_ids that already have an F3 (same derivation as integrar_f3)."""
@@ -304,12 +392,15 @@ def resolve_ts(row, ts_by_visita: dict[str, pd.Timestamp]) -> pd.Timestamp | Non
 
 def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
                        zones: list[dict], ts_by_visita: dict[str, pd.Timestamp],
-                       now: datetime, top: int | None = None) -> pd.DataFrame:
+                       now: datetime, top: int | None = None,
+                       ede: list[dict] | None = None) -> pd.DataFrame:
     """Persistent roster: every geolocated registro becomes a row tagged
     `visitado` (already has an F3 in integracion_f3) or `pendiente`. Pendientes
     are scored and ranked; `top=None` (default) keeps them all, `top=N` caps to
     a worklist of the N most prioritized. Visitados are always all kept so the
-    dashboard shows visited-vs-pending progress. `done` = the F3 set."""
+    dashboard shows visited-vs-pending progress. `done` = the F3 set. `ede` =
+    fetch_ede() points for the EDE cross-reference (None = fetch unavailable,
+    all ede_* fields null)."""
     if df_integrada.empty or "registro_id" not in df_integrada.columns:
         return pd.DataFrame(columns=OUT_COLS + WEB_EXTRA_COLS)
     src_df = df_integrada.copy()
@@ -333,6 +424,7 @@ def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
     geoms = [shape(f["geometry"]) for f in zones]
     props = [f["properties"] for f in zones]
     tree = STRtree(geoms) if geoms else None
+    ede_by_gid = {e["globalid"]: e for e in (ede or []) if e["globalid"]}
 
     def zone_for(x, y):
         if tree is None or pd.isna(x) or pd.isna(y):
@@ -363,7 +455,10 @@ def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
         resc = _num(src.get("n_rescatados_total", ""))
         gsev = graph_severity(" ".join(str(src.get(c, "")) for c in DAMAGE_TEXT_COLS))
         visitado = str(src.get("registro_id", "")).strip() in done
+        ede_fields = match_ede(src.get("sitio_id", ""), float(y), float(x),
+                               ede, ede_by_gid)
         rows.append({
+            **ede_fields,
             "estado_visita": "visitado" if visitado else "pendiente",
             "id_asignacion": id_asignacion(src.get("registro_id", "")),
             "registro_id": src.get("registro_id", ""),
@@ -497,9 +592,19 @@ def _selfcheck():
     done = f3_done_registros(df_match)
     assert done == {"AAAA-1111"}, done
 
+    # EDE globalid/fecha normalization (ArcGIS may return '{UPPER-GUID}', ms UTC).
+    assert (_norm_globalid("{4E1D9AF4-AEF8-4A5D-A58B-6171C0BDF647}")
+            == "4e1d9af4-aef8-4a5d-a58b-6171c0bdf647")
+    assert _norm_globalid("") == "" and _norm_globalid(None) == ""
+    ms = int(pd.Timestamp("2026-08-15 03:00", tz="UTC").value // 10**6)
+    assert _ede_fecha(ms) == "2026-08-14"  # 03:00 UTC = 22:00 Bogota, previous day
+    assert _ede_fecha("") is None and _ede_fecha(None) is None
+
     now = datetime(2026, 8, 16, 12, 0)
     df_integrada = pd.DataFrame({
         "registro_id": ["AAAA-1111", "BBBB-2222", "CCCC-3333", "DDDD-4444"],
+        "sitio_id": ["arcgis:{4E1D9AF4-AEF8-4A5D-A58B-6171C0BDF647}",
+                     "manual:3.445,-76.535", "", ""],
         "visita_id": ["1111", "2222", "3333", ""],
         "direccion_unificada": ["CL 1 # 2-3", "CL 4 # 5-6", "CL 7 # 8-9", "CL 10"],
         "barrio_unificado": ["B1", "B2", "B3", "B4"],
@@ -518,7 +623,15 @@ def _selfcheck():
         "n_rescatados_total": ["0", "0", "0", ""],
     })
     ts = {"2222": pd.Timestamp(2026, 8, 11, 8, 0), "3333": pd.Timestamp(2026, 8, 15, 8, 0)}
-    out = build_asignaciones(df_integrada, done, zones, ts, now, top=100)
+    ede_pts = [
+        # AAAA-1111's arcgis globalid, but geographically far -> globalid match.
+        {"globalid": "4e1d9af4-aef8-4a5d-a58b-6171c0bdf647", "lat": 3.9000,
+         "lon": -76.9000, "fecha_inspeccion": "2026-08-15", "nombre_evaluador": "Eval 1"},
+        # Same coords as CCCC-3333 -> proximity match.
+        {"globalid": "bbbbbbbb-0000-0000-0000-000000000000", "lat": 3.405,
+         "lon": -76.555, "fecha_inspeccion": "2026-08-16", "nombre_evaluador": "Eval 2"},
+    ]
+    out = build_asignaciones(df_integrada, done, zones, ts, now, top=100, ede=ede_pts)
 
     assert list(out.columns) == OUT_COLS + WEB_EXTRA_COLS
     assert out["registro_id"].is_unique
@@ -541,12 +654,24 @@ def _selfcheck():
     assert r_mid["grafo_severidad"] == 0.25
     assert r_mid["comuna_corregimiento"] == "Comuna 19"        # "19" bare -> normalized
 
+    # EDE cascade: globalid wins over distance, then 40 m proximity, then miss.
+    ede_rec = {r["registro_id"]: r for r in out.to_dict("records")}
+    a = ede_rec["AAAA-1111"]   # arcgis placeId in the layer, EDE point far away
+    assert a["ede_hecha"] and a["ede_match"] == "globalid", a
+    assert a["ede_fecha"] == "2026-08-15" and pd.isna(a["ede_dist_m"]), a
+    b = ede_rec["BBBB-2222"]   # manual placeId, no EDE point within 40 m
+    assert b["ede_hecha"] is not None and not b["ede_hecha"], b
+    assert pd.isna(b["ede_match"]) and pd.isna(b["ede_fecha"]) and pd.isna(b["ede_dist_m"]), b
+    c = ede_rec["CCCC-3333"]   # no placeId, EDE point at the same coords
+    assert c["ede_hecha"] and c["ede_match"] == "cercania", c
+    assert c["ede_fecha"] == "2026-08-16" and c["ede_dist_m"] == 0, c
+
     vis = out[out["estado_visita"] == "visitado"]
     assert (vis["prioridad"].astype(str) == "").all()          # visitados sin orden de worklist
     assert pd.notna(out["lat"]).all() and pd.notna(out["lon"]).all()
     assert out["id_asignacion"].str.fullmatch(r"[0-9A-Z]{5}").all()
     assert out["id_asignacion"].is_unique
-    out2 = build_asignaciones(df_integrada, done, zones, ts, now, top=100)
+    out2 = build_asignaciones(df_integrada, done, zones, ts, now, top=100, ede=ede_pts)
     assert list(out2["id_asignacion"]) == list(out["id_asignacion"])  # stable across runs
 
     # Degraded inputs never crash: empty frames -> empty output
@@ -558,6 +683,8 @@ def _selfcheck():
     out_fb = build_asignaciones(solo_coords, done, zones, ts, now)
     assert set(out_fb["registro_id"]) == set(out["registro_id"]), out_fb["registro_id"].tolist()
     assert (out_fb["coords"].astype(str).str.strip() != "").all()
+    # ede=None (ArcGIS fetch failed) -> ede_hecha null (unknown), never False.
+    assert out_fb["ede_hecha"].isna().all() and out_fb["ede_match"].isna().all()
     print("selfcheck ok")
 
 
@@ -601,12 +728,19 @@ def export_web(out: pd.DataFrame, zones: list[dict], now: datetime) -> None:
     if not web_data.exists():
         print(f"web/data ausente ({web_data}); no exporto al frontend")
         return
-    records = out.where(out.notna(), None).to_dict(orient="records")
+    # astype(object) first: on float/mixed columns .where() coerces None back
+    # to NaN, and json.dumps would emit literal NaN that JSON.parse rejects.
+    records = out.astype(object).where(out.notna(), None).to_dict(orient="records")
     n_vis = int((out["estado_visita"] == "visitado").sum())
+    # EDE counters: null (unknown) when the whole column is null — the ArcGIS
+    # fetch failed and 0 pendientes would be a lie the UI can't distinguish.
+    ede_known = bool(out["ede_hecha"].notna().any()) if not out.empty else False
     payload = {
         "generated_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
         "pendientes": int(len(out) - n_vis),
         "visitados": n_vis,
+        "ede_hechas": int(out["ede_hecha"].eq(True).sum()) if ede_known else None,
+        "ede_pendientes": int(out["ede_hecha"].eq(False).sum()) if ede_known else None,
         "zonas": len(zones),
         "records": records,
     }
@@ -638,6 +772,13 @@ def main() -> dict:
     except OSError as exc:  # geojson es un subproducto, no bloquear la corrida
         print(f"{len(zones)} zonas desde {kml_path.name} (geojson no escrito: {exc})")
 
+    try:
+        ede = fetch_ede()
+        print(f"EDE Survey123: {len(ede)} puntos")
+    except Exception as exc:  # noqa: BLE001 - scheduled job; EDE cross-ref is best-effort
+        print(f"WARN: no pude leer la capa EDE Survey123 ({exc}); ede_*=null para todos")
+        ede = None
+
     gc = gspread.authorize(credentials(READONLY))
     df_integrada = api_visitados.fetch_tabla()
     if df_integrada.empty:
@@ -650,7 +791,7 @@ def main() -> dict:
           f"| timestamps visitas: {len(ts_by_visita)}")
 
     now = datetime.now()
-    out = build_asignaciones(df_integrada, done, zones, ts_by_visita, now, top=top)
+    out = build_asignaciones(df_integrada, done, zones, ts_by_visita, now, top=top, ede=ede)
     n_vis = int((out["estado_visita"] == "visitado").sum()) if not out.empty else 0
     n_pend = len(out) - n_vis
     n_gsev = int((pd.to_numeric(out["grafo_severidad"], errors="coerce") > 0).sum()) if not out.empty else 0
@@ -659,11 +800,20 @@ def main() -> dict:
     pend_scores = pd.to_numeric(out.loc[out["estado_visita"] == "pendiente", "score"], errors="coerce")
     score_max = float(pend_scores.max()) if len(pend_scores) else 0.0
     score_min = float(pend_scores.min()) if len(pend_scores) else 0.0
+    # Same tri-state guard as export_web: an all-null ede_hecha means the
+    # fetch failed, and "0/0" in the cron log would read as a confirmed zero.
+    ede_known = bool(out["ede_hecha"].notna().any()) if not out.empty else False
+    n_ede = int(out["ede_hecha"].eq(True).sum()) if ede_known else None
+    n_ede_falta = int(out["ede_hecha"].eq(False).sum()) if ede_known else None
+    ede_txt = (f"EDE hechas: {n_ede} | EDE pendientes: {n_ede_falta}"
+               if ede_known else "EDE: sin datos (fetch falló)")
     print(f"asignaciones: {len(out)} filas | pendientes: {n_pend} | visitados: {n_vis} "
           f"| con daño en grafo: {n_gsev} | con víctimas: {n_victimas} "
+          f"| {ede_txt} "
           f"| score pendientes max/min: {score_max}/{score_min}")
     summary = {"filas": len(out), "pendientes": n_pend, "visitados": n_vis,
                "con_grafo": n_gsev, "con_victimas": n_victimas,
+               "ede_hechas": n_ede, "ede_pendientes": n_ede_falta,
                "zonas_kml": len(zones), "registros_con_f3": len(done)}
 
     # Static artifacts for the dashboard (roster with lat/lon + zones geojson).
