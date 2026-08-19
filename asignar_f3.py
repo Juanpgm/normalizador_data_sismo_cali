@@ -1,9 +1,11 @@
-"""Prioritized F3 assignments from tabla_integrada + KML assignment zones.
+"""Prioritized F3 assignments from the visitados-criticos API + KML assignment
+zones.
 
-Reads `tabla_integrada` (EDAN SISMO sheet) and the `integracion_f3` tab and
-builds a persistent assignment roster: every geolocated registro is tagged
-`visitado` (already has an F3 in `integracion_f3`) or `pendiente`, and each is
-placed in an assignment-zone polygon from the KML priorization map. Pendientes
+Reads the critical-case table from the visitados-criticos REST API and the
+`integracion_f3` tab and builds a persistent assignment roster: every
+geolocated registro is tagged `visitado` (already has an F3 in
+`integracion_f3`) or `pendiente`, and each is placed in an assignment-zone
+polygon from the KML priorization map. Pendientes
 are scored with a null-safe weighted sum and only the top-N ranked ones are
 kept; visitados are all kept so the dashboard shows visited-vs-pending progress.
 
@@ -19,7 +21,7 @@ dashboard artifacts `web/data/asignaciones.json` and
     python asignar_f3.py --check     # offline self-check, no network
     python asignar_f3.py --dry       # real data, write output/asignaciones.xlsx only
     python asignar_f3.py             # real data, write the asignaciones tab
-    python asignar_f3.py --top 150   # change the number of ranked rows (default 100)
+    python asignar_f3.py --top 150   # cap to a worklist of N pendientes (default: all)
 """
 from __future__ import annotations
 
@@ -38,13 +40,13 @@ import pandas as pd
 from shapely.geometry import Point, shape
 from shapely.strtree import STRtree
 
-from integracion.config import (EDAN_SPREADSHEET_ID, VISITAS_SHEET_NAME,
+from integracion import api_visitados
+from integracion.config import (BOGOTA_TZ, VISITAS_SHEET_NAME,
                                 VISITAS_SPREADSHEET_ID)
 from integracion.coords import parse_latlon
 from integracion.gauth import credentials
 
 F3_SPREADSHEET_ID = "19k--nAEScol_3E7nbSpPev07gW2_UT8ojSsaMGbn6Ds"
-INTEGRADA_TAB = "tabla_integrada"
 F3_MATCH_TAB = "integracion_f3"
 DST_TAB = "asignaciones"
 READONLY = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
@@ -158,7 +160,7 @@ def write_geojson(features: list[dict], path: Path) -> None:
 # ── Scoring components (all null-safe: unknown/missing -> 0.0) ────────────────
 def riesgo_value(v) -> float:
     s = str(v or "").lower()
-    if "alto" in s:
+    if "alto" in s or "colapso" in s:  # API nivel_riesgo carries long collapse labels
         return 1.0
     if "medio" in s:
         return 0.6
@@ -284,13 +286,30 @@ def f3_done_registros(df_f3_match: pd.DataFrame) -> set[str]:
     return set(rids[rids.str.strip().ne("")])
 
 
+def resolve_ts(row, ts_by_visita: dict[str, pd.Timestamp]) -> pd.Timestamp | None:
+    """Record timestamp for age scoring. Prefers `evaluacion_creado_utc` (the
+    API's own epoch-ms field, converted to naive Bogota-local so it lines up
+    with the Google-Form join below) when present; falls back to the
+    Visitas-sheet join otherwise. `visita_id` from the API is the evaluation
+    id, a disjoint id-space from the Google Form's `visita_id`, so the join
+    alone silently misses every API row."""
+    raw = str(row.get("evaluacion_creado_utc", "")).strip()
+    if raw:
+        try:
+            return pd.Timestamp(int(raw), unit="ms", tz="UTC").tz_convert(BOGOTA_TZ).tz_localize(None)
+        except (TypeError, ValueError):
+            pass
+    return ts_by_visita.get(str(row.get("visita_id", "")).strip())
+
+
 def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
                        zones: list[dict], ts_by_visita: dict[str, pd.Timestamp],
-                       now: datetime, top: int = 100) -> pd.DataFrame:
+                       now: datetime, top: int | None = None) -> pd.DataFrame:
     """Persistent roster: every geolocated registro becomes a row tagged
     `visitado` (already has an F3 in integracion_f3) or `pendiente`. Pendientes
-    are scored and only the top-N ranked ones are kept; visitados are all kept
-    so the dashboard shows visited-vs-pending progress. `done` = the F3 set."""
+    are scored and ranked; `top=None` (default) keeps them all, `top=N` caps to
+    a worklist of the N most prioritized. Visitados are always all kept so the
+    dashboard shows visited-vs-pending progress. `done` = the F3 set."""
     if df_integrada.empty or "registro_id" not in df_integrada.columns:
         return pd.DataFrame(columns=OUT_COLS + WEB_EXTRA_COLS)
     src_df = df_integrada.copy()
@@ -330,7 +349,7 @@ def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
         if pd.isna(x) or pd.isna(y):
             continue  # sin coordenadas no se puede despachar una cuadrilla
         zone = zone_for(x, y)
-        ts = ts_by_visita.get(str(src.get("visita_id", "")).strip())
+        ts = resolve_ts(src, ts_by_visita)
         age_days = ((now - ts).total_seconds() / 86400.0) if ts is not None else None
 
         flags = []
@@ -396,8 +415,10 @@ def build_asignaciones(df_integrada: pd.DataFrame, done: set[str],
 
     pend = (out[out["estado_visita"] == "pendiente"]
             .sort_values(["score", "_age_sort", "registro_id"],
-                         ascending=[False, False, True])
-            .head(top).reset_index(drop=True))
+                         ascending=[False, False, True]))
+    if top is not None:
+        pend = pend.head(top)
+    pend = pend.reset_index(drop=True)
     pend["prioridad"] = pend.index + 1
     vis = (out[out["estado_visita"] == "visitado"]
            .sort_values(["score", "registro_id"], ascending=[False, True])
@@ -606,7 +627,7 @@ def main() -> dict:
     if "--check" in sys.argv:
         _selfcheck()
         return {}
-    top = int(sys.argv[sys.argv.index("--top") + 1]) if "--top" in sys.argv else 100
+    top = int(sys.argv[sys.argv.index("--top") + 1]) if "--top" in sys.argv else None
 
     kml_path = resolve_kml()
     zones = parse_zonas_kml(kml_path)
@@ -618,11 +639,14 @@ def main() -> dict:
         print(f"{len(zones)} zonas desde {kml_path.name} (geojson no escrito: {exc})")
 
     gc = gspread.authorize(credentials(READONLY))
-    df_integrada = _read_tab(gc, EDAN_SPREADSHEET_ID, INTEGRADA_TAB)
+    df_integrada = api_visitados.fetch_tabla()
+    if df_integrada.empty:
+        raise SystemExit("visitados-criticos API returned 0 casos; aborting before "
+                          "any write (refusing to overwrite asignaciones/web export with empty data).")
     df_match = _read_tab(gc, F3_SPREADSHEET_ID, F3_MATCH_TAB)
     ts_by_visita = load_visitas_timestamps(gc)
     done = f3_done_registros(df_match)
-    print(f"tabla_integrada: {len(df_integrada)} | con F3: {len(done)} "
+    print(f"visitados-criticos: {len(df_integrada)} | con F3: {len(done)} "
           f"| timestamps visitas: {len(ts_by_visita)}")
 
     now = datetime.now()

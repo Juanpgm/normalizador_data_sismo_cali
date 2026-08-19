@@ -1,16 +1,17 @@
-"""Match EDAN-F3 records against the EDAN SISMO integrated table.
+"""Match EDAN-F3 records against the visitados-criticos API data.
 
-Reads `tabla_normalizada` from the EDAN-F3 sheet and `tabla_integrada` from the
-EDAN SISMO sheet, runs the existing 7-tier matching cascade (address + coords)
-framing tabla_integrada as the "edan" side and F3 as the "visitas" side, and
-writes the COMPLETE tabla_integrada listing to the `integracion_f3` tab: one row
-per registro (one per match pair when several F3 points hit the same registro).
-Rows with an F3 match carry edan_id and the registro_id concatenated with it;
-rows with empty edan_id are the pending list — sites with no F3 inspection yet,
-ready for assignment. Finally, F3 points with NO registro in tabla_integrada
-(brand-new sites) are appended at the end, tagged `match_method = solo_f3`.
+Reads `tabla_normalizada` from the EDAN-F3 sheet and the critical-case table
+from the visitados-criticos REST API, runs the existing 7-tier matching
+cascade (address + coords) framing the API table as the "edan" side and F3 as
+the "visitas" side, and writes the COMPLETE listing to the `integracion_f3`
+tab: one row per registro (one per match pair when several F3 points hit the
+same registro). Rows with an F3 match carry edan_id and the registro_id
+concatenated with it; rows with empty edan_id are the pending list — sites
+with no F3 inspection yet, ready for assignment. Finally, F3 points with NO
+registro in the API table (brand-new sites) are appended at the end, tagged
+`match_method = solo_f3`.
 
-Only the `integracion_f3` tab is ever written. `tabla_integrada` and
+Only the `integracion_f3` tab is ever written. The API table and
 `tabla_normalizada` are read-only here.
 
     python integrar_f3.py --check   # offline self-check, no network
@@ -25,14 +26,13 @@ from collections import Counter
 import gspread
 import pandas as pd
 
-from integracion.config import EDAN_SPREADSHEET_ID
+from integracion import api_visitados
 from integracion.gauth import credentials
 from integracion.matching import build_match_table
 
 F3_SPREADSHEET_ID = "19k--nAEScol_3E7nbSpPev07gW2_UT8ojSsaMGbn6Ds"
 F3_SRC_TAB = "tabla_normalizada"
 DST_TAB = "integracion_f3"
-INTEGRADA_TAB = "tabla_integrada"
 READONLY = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 WRITE = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -168,8 +168,11 @@ def main() -> dict:
 
     gc = gspread.authorize(credentials(READONLY))
     df_f3 = _read_tab(gc, F3_SPREADSHEET_ID, F3_SRC_TAB)
-    df_integrada = _read_tab(gc, EDAN_SPREADSHEET_ID, INTEGRADA_TAB)
-    print(f"read {len(df_f3)} F3 rows, {len(df_integrada)} tabla_integrada rows")
+    df_integrada = api_visitados.fetch_tabla()
+    if df_integrada.empty:
+        raise SystemExit("visitados-criticos API returned 0 casos; aborting before "
+                          "any write (refusing to clear integracion_f3 with empty data).")
+    print(f"read {len(df_f3)} F3 rows, {len(df_integrada)} visitados-criticos rows")
 
     out = build_integracion_f3(df_integrada, df_f3)
     pairs = ~out["match_method"].isin(["", "solo_f3"])            # registro <-> F3 match
