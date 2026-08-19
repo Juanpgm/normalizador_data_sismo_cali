@@ -76,7 +76,7 @@ SERVICES = [
     # service_id -> el script lo crea. Necesita en Railway: GOOGLE_SERVICE_ACCOUNT_JSON
     # (SA de dagma-85aad) e INSPECTIONS_URL (inspections.json publicado en Vercel).
     {"name": "cruce-gestion", "start_command": "python job_cruce.py",
-     "cron": EVERY_15, "service_id": None},
+     "cron": EVERY_15, "service_id": "b4c8fd15-aa3b-4157-b787-2034c89a108b"},
 ]
 
 COMMON = {"restartPolicyType": "NEVER", "numReplicas": 1}
