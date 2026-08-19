@@ -12,3 +12,4 @@ pyproj>=3.5           # MAGNA-SIRGAS (EPSG:3115) → WGS84
 shapely>=2.0          # spatial bridge: point-in-parcel
 pytest>=7.0           # tests
 pypdf
+google-cloud-firestore
