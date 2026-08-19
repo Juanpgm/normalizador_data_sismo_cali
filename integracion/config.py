@@ -1,6 +1,7 @@
 """Central configuration: data sources, paths and tunable thresholds."""
 from __future__ import annotations
 
+import os
 from datetime import timedelta, timezone
 from pathlib import Path
 
@@ -19,6 +20,13 @@ from .envfile import load_env_file  # noqa: E402
 
 load_env_file(ROOT / ".env")
 SERVICE_ACCOUNT_FILE = str(ROOT / "service_account.json")
+
+# ── Firestore (dagma) — registro gestionable del cruce criticos<->survey ──────
+# La key del proyecto dagma-85aad vive FUERA del repo; su ruta (o el JSON entero)
+# llega por env. service_account.json (pmegeocode) NO alcanza dagma.
+FIRESTORE_SA_FILE = os.environ.get("FIREBASE_SA", "")        # ruta a la key
+FIRESTORE_PROJECT = os.environ.get("FIREBASE_PROJECT", "dagma-85aad")
+FIRESTORE_COLLECTION = "cruce_criticos_survey"
 DATA_DIR = ROOT / "data"
 CATASTRO_DIR = DATA_DIR / "catastro"
 OUTPUT_DIR = ROOT / "output"

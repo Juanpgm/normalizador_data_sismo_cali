@@ -56,19 +56,27 @@ ENVIRONMENT_ID = "4418f451-bd97-4d96-ba6e-b5ecbbd49c9b"
 # Desired fleet. `name` is unique within the project (the idempotency key). The
 # already-provisioned hourly service is named `normalizador`; its id is pinned
 # so a name change never detaches it.
+# Cadencia unificada de lectura: cada 15 min ("*/15 * * * *"). El cruce de
+# gestión (críticos↔survey + push a Firestore) corre en la misma cadencia.
+EVERY_15 = "*/15 * * * *"
+
 SERVICES = [
     {"name": "normalizador", "start_command": "python job.py",
-     "cron": "0 * * * *", "service_id": "c4f7fdf7-88bb-42d5-9442-42ac75517bbd"},
+     "cron": EVERY_15, "service_id": "c4f7fdf7-88bb-42d5-9442-42ac75517bbd"},
     {"name": "integracion-f3", "start_command": "python job_integrar_f3.py",
-     "cron": "0 */2 * * *", "service_id": "10573e05-b476-4296-80f9-8dd10c2c55cb"},
+     "cron": EVERY_15, "service_id": "10573e05-b476-4296-80f9-8dd10c2c55cb"},
     {"name": "asignaciones", "start_command": "python job_asignaciones.py",
-     "cron": "0 21 * * *",   # 16:00 America/Bogota (UTC-5)
-     "service_id": "d46b3e86-3507-4597-ba65-250b6654cbd3"},
+     "cron": EVERY_15, "service_id": "d46b3e86-3507-4597-ba65-250b6654cbd3"},
     # Refreshes the Vercel dashboard from the F3 Sheet. Different image entirely
     # (deploy/ in the dashboard repo): its Dockerfile CMD is the entrypoint, so
     # no startCommand override — this script only owns its schedule.
     {"name": "dashboard-refresh", "start_command": None,
-     "cron": "0 * * * *", "service_id": "156e97a2-596b-4861-95f4-4060dab408e2"},
+     "cron": EVERY_15, "service_id": "156e97a2-596b-4861-95f4-4060dab408e2"},
+    # Cruce críticos↔survey + push a Firestore (gestión). Nuevo servicio: sin
+    # service_id -> el script lo crea. Necesita en Railway: GOOGLE_SERVICE_ACCOUNT_JSON
+    # (SA de dagma-85aad) e INSPECTIONS_URL (inspections.json publicado en Vercel).
+    {"name": "cruce-gestion", "start_command": "python job_cruce.py",
+     "cron": EVERY_15, "service_id": None},
 ]
 
 COMMON = {"restartPolicyType": "NEVER", "numReplicas": 1}

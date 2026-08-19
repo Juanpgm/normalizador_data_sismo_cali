@@ -1,0 +1,43 @@
+rules_version = '2';
+
+// Reglas Firestore de dagma-85aad.
+// Solo abren las colecciones del cruce criticos<->survey; todo lo demas queda
+// bloqueado (default), asi la app dagma-capture (que escribe server-side con
+// admin SDK, saltandose reglas) no se ve afectada.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Registro del cruce: cualquiera lo LEE (dashboard publico); solo el equipo
+    // aprovisionado (custom claim pmu==true) puede EDITAR, y unicamente los campos
+    // de gestion (no los hechos del cruce). Un registro espontaneo por el apiKey
+    // publico queda en solo-lectura por no tener el claim. Crear/borrar es
+    // exclusivo del pipeline server-side (admin SDK, se salta las reglas).
+    match /cruce_criticos_survey/{doc} {
+      allow read: if true;
+      allow update: if request.auth != null && request.auth.token.pmu == true
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['gestion_estado', 'gestion_asignado_a', 'gestion_nota',
+                       'gestion_despacho_id',
+                       'gestion_actualizado_utc', 'gestion_actualizado_por']);
+      allow create, delete: if false;
+    }
+
+    // Resumen: lectura publica, escritura solo server-side.
+    match /_meta/{doc} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Despachos (cuadrillas asignadas a zonas): lectura publica; el equipo
+    // aprovisionado tiene CRUD completo (crear/editar/eliminar) para gestionar.
+    match /despachos/{doc} {
+      allow read: if true;
+      allow create, update, delete: if request.auth != null && request.auth.token.pmu == true;
+    }
+
+    // Resto: bloqueado.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
