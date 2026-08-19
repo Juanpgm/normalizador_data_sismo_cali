@@ -39,6 +39,9 @@ BASE_URL = ("https://script.google.com/macros/s/"
             "AKfycbw4uRh_HkiZtKgvb1ZkGYt_m5wydNFWw1SkN6D2ttGEaLm_V4cHOJCqg5I581hqevuP/exec")
 MAX_MATCH_M = 40.0
 ADDR_MATCH_RATIO = 0.90
+COMBO_MAX_M = 60.0     # casi-match geo con dirección fuerte (evidencia combinada)
+COMBO_RATIO = 0.85
+PREFIX_MAX_M = 150.0   # misma dirección con sufijo pegado (barrio sin coma)
 PENDING_STATES = {"PENDIENTE", "EN_ATENCION"}
 
 HERE = Path(__file__).resolve().parent
@@ -98,10 +101,23 @@ def _punto_latlon(p: dict):
     return (lat, lon) if lat is not None and lon is not None else None
 
 
+import re as _re
+
+_CARDINALES = [(_re.compile(r"\bNORTE\b|\bNTE\.?\b"), "N"),
+               (_re.compile(r"\bOESTE\b|\bOE\.?\b"), "O"),
+               (_re.compile(r"\bESTE\b"), "E"),
+               (_re.compile(r"\bSUR\b"), "S")]
+
+
 def addr_key(direccion) -> str:
     """Comparable address key: IGAC-normalized nomenclature, complement (after
-    the first comma: barrio/ciudad suffixes) dropped, uppercased."""
-    return normalize_address(direccion).split(",")[0].strip().upper()
+    the first comma: barrio/ciudad suffixes) dropped, cardinal words collapsed
+    to their single-letter suffix (NORTE -> N), uppercased."""
+    s = normalize_address(direccion).split(",")[0].strip().upper()
+    for pat, letter in _CARDINALES:
+        s = pat.sub(letter, s)
+    s = _re.sub(r"(\d) ([NSEO])\b", r"\1\2", s)  # "63 N" -> "63N"
+    return _re.sub(r"\s+", " ", s).strip()
 
 
 def build_addr_index(evaluaciones: list[dict]) -> list[tuple[str, dict]]:
@@ -114,33 +130,61 @@ def build_addr_index(evaluaciones: list[dict]) -> list[tuple[str, dict]]:
     return out
 
 
-def match_by_direccion(direccion, addr_index: list[tuple[str, dict]]):
-    """Evaluacion whose normalized address equals — or fuzzily matches
-    (ratio >= ADDR_MATCH_RATIO) — the record's. None when no confident match."""
+def _dist_to(lat, lon, e: dict):
+    ll = _eval_latlon(e)
+    if ll is None or lat is None or lon is None:
+        return None
+    return haversine_m((lat, lon), ll)
+
+
+def match_by_direccion(lat, lon, direccion, addr_index: list[tuple[str, dict]]):
+    """Best evaluacion by normalized address. Returns (evaluacion, via, dist_m)
+    or (None, None, None). Acceptance ladder — every rule below the exact one
+    demands that DISTANCE and ADDRESS point at the SAME evaluacion, or near-
+    identical addresses at different points of the city false-positive:
+
+    - exacta:    same normalized key                      -> "direccion"
+    - fuzzy:     ratio >= 0.90                            -> "direccion"
+    - prefijo:   one key is a prefix of the other (barrio
+                 glued without comma) and that evaluacion
+                 is <= 150 m away                         -> "combinado"
+    - combinado: ratio >= 0.85 and that evaluacion is
+                 <= 60 m away (near-miss on both axes)    -> "combinado"
+    """
     key = addr_key(direccion)
     if not key:
-        return None
-    best, best_ratio = None, ADDR_MATCH_RATIO
+        return None, None, None
+    for k, e in addr_index:
+        if k == key:
+            return e, "direccion", _dist_to(lat, lon, e)
+    best, best_ratio = None, 0.0
     # ponytail: O(roster_sin_geo × evaluaciones) SequenceMatcher scan; index by
     # via+numero if it ever gets slow.
     for k, e in addr_index:
-        if k == key:
-            return e
+        if len(key) >= 8 and len(k) >= 8 and (k.startswith(key) or key.startswith(k)):
+            d = _dist_to(lat, lon, e)
+            if d is not None and d <= PREFIX_MAX_M:
+                return e, "combinado", d
         ratio = SequenceMatcher(None, key, k).ratio()
-        if ratio >= best_ratio:
+        if ratio > best_ratio:
             best, best_ratio = e, ratio
-    return best
+    if best is not None and best_ratio >= ADDR_MATCH_RATIO:
+        return best, "direccion", _dist_to(lat, lon, best)
+    if best is not None and best_ratio >= COMBO_RATIO:
+        d = _dist_to(lat, lon, best)
+        if d is not None and d <= COMBO_MAX_M:
+            return best, "combinado", d
+    return None, None, None
 
 
 def cruce_f3(lat, lon, direccion, evaluaciones: list[dict],
              addr_index: list[tuple[str, dict]]) -> dict:
-    """F3 visit already done: nearest within 40 m, or (fallback) same
-    normalized address. f3_match_via says which criterion matched."""
+    """F3 visit already done: nearest within 40 m, or (fallback) address-based
+    match (see match_by_direccion). f3_match_via says which criterion matched."""
     best, dist = nearest(lat, lon, evaluaciones, _eval_latlon)
     via = "geo" if best is not None else None
     if best is None:
-        best = match_by_direccion(direccion, addr_index)
-        via = "direccion" if best is not None else None
+        best, via, dist = match_by_direccion(lat, lon, direccion, addr_index)
     if best is None:
         return {"f3_hecha": False, "f3_global_id": None, "f3_fecha": None,
                 "f3_severidad": None, "f3_habitabilidad": None, "f3_dist_m": None,
@@ -290,6 +334,7 @@ def build_cruce(roster_records: list[dict], zonas: list[dict], evaluaciones: lis
         "total_criticos": len(enriched),
         "f3_hechas": n_f3,
         "f3_por_direccion": sum(1 for r in enriched if r.get("f3_match_via") == "direccion"),
+        "f3_por_combinado": sum(1 for r in enriched if r.get("f3_match_via") == "combinado"),
         "zona_por_poligono": sum(1 for r in enriched if r.get("zona_via") == "poligono"),
         "f3_faltantes": len(enriched) - n_f3,
         "gestor_puntos_totales": len(puntos),
@@ -322,6 +367,8 @@ def _selfcheck():
          "zona_id": "Z9", "estado_visita": "pendiente", "score": 30.0},   # unmatched zona_id -> fuera de zona
         {"registro_id": "R6", "lat": 3.3000, "lon": -76.3000, "direccion": "Calle 1 No. 2-3, Cali",
          "zona_id": "", "estado_visita": "pendiente", "score": 20.0},     # far pero misma dirección normalizada -> hecha (direccion)
+        {"registro_id": "R7", "lat": 3.4309, "lon": -76.5300, "direccion": "CL 1 # 2-3 BARRIO CENTRO",
+         "zona_id": "", "estado_visita": "pendiente", "score": 10.0},     # ~100m + dirección con barrio pegado -> hecha (combinado)
     ]
 
     # nearest(): boundary sanity — same-point match, far-point no-match.
@@ -332,6 +379,7 @@ def _selfcheck():
 
     # Address key + polygon sanity.
     assert addr_key("Calle 1 No. 2-3, Cali") == addr_key("CL 1 # 2-3") == "CL 1 # 2-3"
+    assert addr_key("CL 63 NORTE # 3EN-60") == addr_key("Calle 63 N # 3EN-60") == "CL 63N # 3EN-60"
     poly = _zona_poly(zonas[0])
     assert point_in_poly(3.43, -76.53, poly) is True
     assert point_in_poly(3.00, -76.00, poly) is False
@@ -346,13 +394,16 @@ def _selfcheck():
     assert recs["R2"]["f3_hecha"] is False and recs["R2"]["f3_global_id"] is None
     assert recs["R2"]["zona_id"] == "Z1" and recs["R2"]["zona_via"] == "roster"    # fuera del polígono
     assert recs["R6"]["f3_hecha"] is True and recs["R6"]["f3_match_via"] == "direccion"
-    assert recs["R6"]["f3_global_id"] == "E1" and recs["R6"]["f3_dist_m"] is None
+    assert recs["R6"]["f3_global_id"] == "E1" and recs["R6"]["f3_dist_m"] > 1000  # exacta reporta la distancia igual
+    assert recs["R7"]["f3_hecha"] is True and recs["R7"]["f3_match_via"] == "combinado"
+    assert recs["R7"]["f3_global_id"] == "E1" and 50 < recs["R7"]["f3_dist_m"] < 150
+    assert recs["R7"]["zona_via"] == "poligono"
     assert recs["R1"]["punto_estado"] is None  # nearest punto (Z1) is >40m from R1
 
     assert len(out["zonas"]) == 2  # Z1 + the synthetic "(fuera de zona)" row
     by_id = {z["zona_id"]: z for z in out["zonas"]}
     assert by_id["Z1"] == {"zona_id": "Z1", "comuna": "Comuna 1", "lider": "Ana", "estado_zona": "ASIGNADA",
-                           "despacho_hoy": True, "n_criticos": 2, "n_f3_hechas": 1, "n_faltantes": 1,
+                           "despacho_hoy": True, "n_criticos": 3, "n_f3_hechas": 2, "n_faltantes": 1,
                            "gestor_n_puntos": 5, "gestor_pendientes": 1}, by_id["Z1"]
     fuera = by_id[FUERA_DE_ZONA]  # R4 (blank) + R5 ("Z9") + R6 (blank, F3 por dirección)
     assert fuera == {"zona_id": FUERA_DE_ZONA, "comuna": "", "lider": "", "estado_zona": "",
@@ -360,8 +411,8 @@ def _selfcheck():
                      "gestor_n_puntos": 0, "gestor_pendientes": 0}, fuera
 
     r = out["resumen"]
-    assert r["total_criticos"] == 5 and r["f3_hechas"] == 2 and r["f3_faltantes"] == 3
-    assert r["f3_por_direccion"] == 1 and r["zona_por_poligono"] == 1
+    assert r["total_criticos"] == 6 and r["f3_hechas"] == 3 and r["f3_faltantes"] == 3
+    assert r["f3_por_direccion"] == 1 and r["f3_por_combinado"] == 1 and r["zona_por_poligono"] == 2
     assert r["gestor_puntos_totales"] == 1 and r["gestor_puntos_pendientes"] == 1
     assert r["zonas_con_despacho_hoy"] == 1
     # Table (zonas rollup) reconciles with the summary card.
