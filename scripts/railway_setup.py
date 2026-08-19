@@ -86,6 +86,14 @@ def _token() -> str:
     token = os.environ.get("RAILWAY_API_TOKEN", "").strip()
     if token:
         return token
+    # Project token del .env del subproyecto (tiene prioridad sobre el token de
+    # cuenta cacheado por `railway login`, que puede estar expirado/sin scope).
+    env = Path(__file__).resolve().parent.parent / ".env"
+    if env.exists():
+        for ln in env.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if ln.startswith("RAILWAY_API_TOKEN") and "=" in ln:
+                return ln.split("=", 1)[1].strip().strip("\"'")
     config = Path.home() / ".railway" / "config.json"
     if not config.exists():
         raise SystemExit("No Railway credentials. Run `railway login` or set "
@@ -99,7 +107,9 @@ def gql(query: str, variables: dict | None = None) -> dict:
         data=json.dumps({"query": query, "variables": variables or {}}).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {_token()}",
+            # Token de PROYECTO (creado en el dashboard del proyecto): Railway lo
+            # autoriza con el header Project-Access-Token, no con Authorization Bearer.
+            "Project-Access-Token": _token(),
             # Cloudflare answers 403 to requests without a User-Agent.
             "User-Agent": "normalizador-sismo-cali/1.0",
         },

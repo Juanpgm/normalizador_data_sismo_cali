@@ -46,6 +46,17 @@ ZONES_GEOJSON = REPO_ROOT / "web" / "data" / "zonas_asignacion.geojson"
 MATCH_MAX_M = 20.0  # radio de match (coords corregidas -> radio apretado y seguro)
 
 
+def _num_or_none(v):
+    """'2' -> 2, ''/None/basura -> None (para víctimas y timestamps de la API)."""
+    s = str(v or "").strip()
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except ValueError:
+        return None
+
+
 # -- survey normalizado (coords corregidas) -----------------------------------
 def load_survey(path: Path = INSPECTIONS_JSON) -> list[dict]:
     """Puntos EDE de inspections.json (survey normalizado con coords CORREGIDAS).
@@ -140,6 +151,7 @@ def build_cruce(criticos, survey: list[dict], zone_for) -> dict:
         rec = {
             "clave_integracion": id_asignacion(rid),
             "registro_id": rid,
+            "evaluacion_id": c.get("visita_id"),  # id de la evaluación en la API
             "estado": m["estado"],
             "match": m["match"],
             "survey_globalid": m["survey_globalid"],
@@ -150,6 +162,17 @@ def build_cruce(criticos, survey: list[dict], zone_for) -> dict:
             "lat": lat, "lon": lon,
             "nivel_riesgo": c.get("nivel_riesgo"),
             "requiere_demolicion": c.get("requiere_demolicion"),
+            # Datos completos del crítico (los que trae la API por evaluación).
+            "estado_api": c.get("estado"),                       # estadoEtiqueta
+            "habitabilidad": c.get("estado_estructura"),         # habitabilidadEtiqueta
+            "tipo_estructura": c.get("tipo_estructura_visita") or c.get("tipo_estructura_edan"),
+            "nombre_estructura": c.get("nombre_estructura"),
+            "n_fallecidos": _num_or_none(c.get("n_fallecidos_total")),
+            "n_atrapamientos": _num_or_none(c.get("n_atrapamientos_total")),
+            "n_rescatados": _num_or_none(c.get("n_rescatados_total")),
+            "descripcion_edan": c.get("descripcion_edan"),
+            "descripcion_visita": c.get("descripcion_visita"),
+            "evaluacion_creado_utc": _num_or_none(c.get("evaluacion_creado_utc")),
             "zona_id": zid, "ola": z.get("ola", ""), "despacho": z.get("despacho", ""),
             "survey_fecha": m["survey_fecha"],
             "survey_evaluador": m["survey_evaluador"],
