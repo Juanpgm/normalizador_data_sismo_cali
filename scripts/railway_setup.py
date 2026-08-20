@@ -57,15 +57,22 @@ ENVIRONMENT_ID = "4418f451-bd97-4d96-ba6e-b5ecbbd49c9b"
 # already-provisioned hourly service is named `normalizador`; its id is pinned
 # so a name change never detaches it.
 # Cadencia unificada de lectura: cada 15 min PERO solo en horario diurno de
-# Colombia (06:00–18:45 COT), en pausa de 19:00 a 05:45. Railway agenda el cron
-# en UTC y Colombia es UTC-5, así que la franja 06:00–18:59 COT es 11:00–23:59
-# UTC → horas 11-23. El cruce de gestión (críticos↔survey + push a Firestore)
-# comparte la misma cadencia.
-EVERY_15 = "*/15 11-23 * * *"
+# Colombia (08:00–19:45 COT), en pausa nocturna. Railway agenda el cron en UTC
+# y Colombia es UTC-5, así que la franja 08:00–19:59 COT es 13:00–00:59 UTC →
+# horas 13-23,0. (Ventana ajustada a mano en la UI 2026-08-20; este script la
+# adopta para que un --apply no la pise.) cruce-gestion corre desfasado a
+# :10/:25/:40/:55 para no pushear a main en el mismo minuto que dashboard-refresh.
+EVERY_15 = "*/15 13-23,0 * * *"
+EVERY_15_OFFSET = "10,25,40,55 13-23,0 * * *"
+# El normalizador (tabla_integrada → Sheet EDAN SISMO) alimenta HUMANOS, no al
+# dashboard (integrar/asignar F3 leen la API atencionsismo desde 2026-08-18):
+# horario alcanza y cuadruplicar escrituras a Sheets no aporta. Minuto :05 para
+# no chocar con los slots :00/:15/... ni :10/:25/... de los otros jobs.
+HOURLY_DAY = "5 13-23,0 * * *"
 
 SERVICES = [
     {"name": "normalizador", "start_command": "python job.py",
-     "cron": EVERY_15, "service_id": "c4f7fdf7-88bb-42d5-9442-42ac75517bbd"},
+     "cron": HOURLY_DAY, "service_id": "c4f7fdf7-88bb-42d5-9442-42ac75517bbd"},
     {"name": "integracion-f3", "start_command": "python job_integrar_f3.py",
      "cron": EVERY_15, "service_id": "10573e05-b476-4296-80f9-8dd10c2c55cb"},
     {"name": "asignaciones", "start_command": "python job_asignaciones.py",
@@ -75,11 +82,11 @@ SERVICES = [
     # no startCommand override — this script only owns its schedule.
     {"name": "dashboard-refresh", "start_command": None,
      "cron": EVERY_15, "service_id": "156e97a2-596b-4861-95f4-4060dab408e2"},
-    # Cruce críticos↔survey + push a Firestore (gestión). Nuevo servicio: sin
-    # service_id -> el script lo crea. Necesita en Railway: GOOGLE_SERVICE_ACCOUNT_JSON
-    # (SA de dagma-85aad) e INSPECTIONS_URL (inspections.json publicado en Vercel).
+    # Cruce críticos↔survey + push a Firestore (gestión). Necesita en Railway:
+    # GOOGLE_SERVICE_ACCOUNT_JSON (SA de dagma-85aad) e INSPECTIONS_URL
+    # (inspections.json publicado en Vercel).
     {"name": "cruce-gestion", "start_command": "python job_cruce.py",
-     "cron": EVERY_15, "service_id": "b4c8fd15-aa3b-4157-b787-2034c89a108b"},
+     "cron": EVERY_15_OFFSET, "service_id": "b4c8fd15-aa3b-4157-b787-2034c89a108b"},
 ]
 
 COMMON = {"restartPolicyType": "NEVER", "numReplicas": 1}
