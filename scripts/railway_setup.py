@@ -56,9 +56,12 @@ ENVIRONMENT_ID = "4418f451-bd97-4d96-ba6e-b5ecbbd49c9b"
 # Desired fleet. `name` is unique within the project (the idempotency key). The
 # already-provisioned hourly service is named `normalizador`; its id is pinned
 # so a name change never detaches it.
-# Cadencia unificada de lectura: cada 15 min ("*/15 * * * *"). El cruce de
-# gestión (críticos↔survey + push a Firestore) corre en la misma cadencia.
-EVERY_15 = "*/15 * * * *"
+# Cadencia unificada de lectura: cada 15 min PERO solo en horario diurno de
+# Colombia (06:00–18:45 COT), en pausa de 19:00 a 05:45. Railway agenda el cron
+# en UTC y Colombia es UTC-5, así que la franja 06:00–18:59 COT es 11:00–23:59
+# UTC → horas 11-23. El cruce de gestión (críticos↔survey + push a Firestore)
+# comparte la misma cadencia.
+EVERY_15 = "*/15 11-23 * * *"
 
 SERVICES = [
     {"name": "normalizador", "start_command": "python job.py",
