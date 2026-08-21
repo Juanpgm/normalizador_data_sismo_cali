@@ -41,6 +41,49 @@ service cloud.firestore {
       allow create, update, delete: if request.auth != null && request.auth.token.pmu == true;
     }
 
+    // Inspecciones del equipo de Israel (survey remapeado a EDE Cali): lectura
+    // publica para el dashboard; crear/editar/borrar solo server-side (admin SDK,
+    // via subir_israel_firebase.py). Coleccion SEPARADA de inspections.json.
+    match /inspecciones_israel/{doc} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Resumen de la corrida de Israel: lectura publica, escritura server-side.
+    match /_meta_israel/{doc} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // ---- Formulario de campo ATC-20 (formulario/) ----
+
+    // Un usuario autenticado solo cuenta como inspector si tiene perfil.
+    function isInspector() {
+      return exists(/databases/$(database)/documents/inspectores/$(request.auth.uid));
+    }
+
+    // Perfil de inspector: cada quien lee solo su doc; solo puede actualizar
+    // su propio doc, unicamente el campo consecutivo, y solo incrementandolo
+    // en exactamente 1 (transaccion de generacion de codigo).
+    match /inspectores/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow update: if request.auth != null && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['consecutivo'])
+        && request.resource.data.consecutivo is int
+        && request.resource.data.consecutivo == resource.data.consecutivo + 1;
+      allow create, delete: if false; // solo consola/admin
+    }
+
+    // Evaluaciones ATC-20: crear solo inspectores registrados y a nombre
+    // propio; leer solo inspectores; nunca actualizar ni borrar (las
+    // reinspecciones son un doc nuevo).
+    match /evaluaciones/{id} {
+      allow create: if isInspector()
+        && request.resource.data.inspector.uid == request.auth.uid;
+      allow read: if isInspector();
+      allow update, delete: if false;
+    }
+
     // Resto: bloqueado.
     match /{document=**} {
       allow read, write: if false;
