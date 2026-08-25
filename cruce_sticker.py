@@ -16,6 +16,17 @@ Phase 2). The job only ever writes the pipeline-owned subset via a
 `cuadrilla_id`/`inspector_uid: null`) on a doc's first write only, and never
 overwrites those fields on a doc that already exists — see `design.md` ADR-1.
 
+INCREMENTAL, not a full re-match every 15 minutes: a point already
+`tiene_sticker=true` is never re-scanned (cheap one-time `tiene_sticker`
+pre-read via `get_all`, not a full-document read), and `evaluaciones` is
+fetched only from `timestamp` after the last successful run's watermark
+(`_meta/cruce_sticker_state`), not the whole collection every time. A
+not-yet-matched point that still doesn't match against the new evaluaciones
+this run is left untouched too — only brand-new points (bootstrap seed) and
+points that just flipped to matched get written. The very first run (no
+watermark, no docs) necessarily scans everything once; steady state
+afterwards is O(new evaluaciones × still-pending points).
+
     python cruce_sticker.py --check     # offline self-check, no network
     python cruce_sticker.py --dry       # real data, no Firestore write
     python cruce_sticker.py             # real data, write sticker_matches
@@ -44,6 +55,7 @@ ISRAEL_JSON = REPO_ROOT / "puntos_israel_cali.json"
 STICKERS_PROJECT = os.environ.get("STICKERS_FIREBASE_PROJECT", "sismo-agosto-sgred")
 STICKER_MATCHES_COLLECTION = "sticker_matches"
 EVALUACIONES_COLLECTION = "evaluaciones"
+STATE_DOC = "_meta/cruce_sticker_state"  # {"last_run_at": Timestamp} — incremental watermark
 
 MATCH_MAX_M = 40.0     # same proximity threshold as cruce_gestor/asignar_f3
 SEM_OK = 0.90           # same "fuzzy exacto" address-ratio threshold as cruce_gestor.ADDR_MATCH_RATIO
@@ -139,11 +151,17 @@ def _firestore_client():
     return firestore.Client(project=STICKERS_PROJECT)  # ADC
 
 
-def fetch_evaluaciones(db) -> list[dict]:
+def fetch_evaluaciones(db, watermark=None) -> list[dict]:
     """Field stickers, flattened with the SAME X/Y/DIRECCION keys cruce_gestor's
-    cascade functions expect — same shape as the notebook's fetch_stickers()."""
+    cascade functions expect — same shape as the notebook's fetch_stickers().
+    `watermark` (a Firestore Timestamp / datetime, or None) restricts this to
+    evaluaciones written AFTER the last successful run — the incremental part:
+    an evaluación already scanned in a prior run is never fetched again."""
+    col = db.collection(EVALUACIONES_COLLECTION)
+    query = (col if watermark is None
+             else col.where("timestamp", ">", watermark)).order_by("timestamp")
     out = []
-    for doc in db.collection(EVALUACIONES_COLLECTION).stream():
+    for doc in query.stream():
         e = doc.to_dict() or {}
         coords = e.get("coords") or {}
         desc = e.get("descripcion") or {}
@@ -152,6 +170,51 @@ def fetch_evaluaciones(db) -> list[dict]:
             "Y": coords.get("lat"), "X": coords.get("lng"),
             "DIRECCION": desc.get("direccion") or "",
         })
+    return out
+
+
+def read_watermark(db):
+    """Timestamp of the last successful run, or None (first run — or a prior
+    run that never reached the end — process every evaluación that exists)."""
+    doc = db.document(STATE_DOC).get()
+    if not doc.exists:
+        return None
+    return (doc.to_dict() or {}).get("last_run_at")
+
+
+def write_watermark(db, when: datetime) -> None:
+    coll, name = STATE_DOC.split("/")
+    db.collection(coll).document(name).set({"last_run_at": when}, merge=True)
+
+
+def read_tiene_sticker_state(db, doc_ids: list[str]) -> dict:
+    """{doc_id: {'exists': bool, 'tiene_sticker': bool}} via one batched
+    get_all with a field_paths projection (cheap — just the one flag, not the
+    full document) — the pre-check that makes candidate selection possible
+    without ever reading every sticker_matches doc in full."""
+    col = db.collection(STICKER_MATCHES_COLLECTION)
+    out: dict[str, dict] = {}
+    for start in range(0, len(doc_ids), BATCH_SIZE):
+        chunk = doc_ids[start:start + BATCH_SIZE]
+        refs = [col.document(did) for did in chunk]
+        for snap in db.get_all(refs, field_paths=["tiene_sticker"]):
+            out[snap.id] = {
+                "exists": snap.exists,
+                "tiene_sticker": bool((snap.to_dict() or {}).get("tiene_sticker")) if snap.exists else False,
+            }
+    return out
+
+
+def select_candidates(panel: list[dict], state: dict) -> list[dict]:
+    """Panel points that actually need a match attempt this run: brand new
+    (no sticker_matches doc yet — bootstrap) or not yet matched. A point
+    already `tiene_sticker=true` is never re-scanned. Pure — no Firestore
+    access, testable offline."""
+    out = []
+    for p in panel:
+        s = state.get(doc_id(p["fuente"], p["registro_id"]), {"exists": False, "tiene_sticker": False})
+        if not s["tiene_sticker"]:
+            out.append(p)
     return out
 
 
@@ -204,19 +267,11 @@ def build_write_ops(points: list[dict], existing_ids: set[str]) -> list[tuple[st
     return ops
 
 
-def write_sticker_matches(db, points: list[dict]) -> int:
+def write_sticker_matches(db, points: list[dict], existing_ids: set[str]) -> int:
+    """`existing_ids` comes from the caller's own pre-read (main() already did
+    read_tiene_sticker_state() to pick candidates) — no second existence query
+    here, that would just re-read what's already known."""
     col = db.collection(STICKER_MATCHES_COLLECTION)
-    refs = [col.document(doc_id(p["fuente"], p["registro_id"])) for p in points]
-
-    existing_ids: set[str] = set()
-    for start in range(0, len(refs), BATCH_SIZE):
-        chunk = refs[start:start + BATCH_SIZE]
-        if not chunk:
-            continue
-        for snap in db.get_all(chunk):
-            if snap.exists:
-                existing_ids.add(snap.id)
-
     ops = build_write_ops(points, existing_ids)
     n = 0
     for start in range(0, len(ops), BATCH_SIZE):
@@ -283,6 +338,24 @@ def _selfcheck_cruce_sticker():
     assert israel_fields["tiene_sticker"] is False and israel_fields["tier"] is None
     assert set(israel_fields) == set(PIPELINE_FIELDS) | set(ADMIN_DEFAULT_FIELDS)
 
+    # (c) select_candidates: the incremental core. A point already
+    # tiene_sticker=true is dropped from the candidate list — never re-scanned,
+    # regardless of whether it even has a doc (defensive: state always says
+    # exists=True when tiene_sticker=True in practice, but the function only
+    # looks at the flag). A brand-new point (no entry in `state` at all) and an
+    # existing-but-still-pending one both stay candidates.
+    panel_c = [
+        {"fuente": "ede", "registro_id": "A"},   # no state entry at all -> new, candidate
+        {"fuente": "ede", "registro_id": "B"},   # exists, pendiente -> candidate
+        {"fuente": "ede", "registro_id": "C"},   # exists, ya con sticker -> NOT a candidate
+    ]
+    state_c = {
+        "ede_B": {"exists": True, "tiene_sticker": False},
+        "ede_C": {"exists": True, "tiene_sticker": True},
+    }
+    cands = select_candidates(panel_c, state_c)
+    assert {p["registro_id"] for p in cands} == {"A", "B"}, cands
+
     print("cruce_sticker self-check OK")
 
 
@@ -298,15 +371,29 @@ def main() -> dict:
         panel = panel[:top]
 
     db = _firestore_client()
-    evaluaciones = fetch_evaluaciones(db)
+
+    doc_ids = [doc_id(p["fuente"], p["registro_id"]) for p in panel]
+    state = read_tiene_sticker_state(db, doc_ids)
+    ya_con_sticker = sum(1 for s in state.values() if s["tiene_sticker"])
+    candidates = select_candidates(panel, state)
+    print(f"Panel: {len(panel)} puntos | ya con sticker (sin re-escanear): {ya_con_sticker} | "
+          f"candidatos este run: {len(candidates)}")
+
+    watermark = read_watermark(db)
+    print(f"watermark: {watermark or '(ninguno — primera corrida, procesa toda evaluaciones)'}")
+    evaluaciones = fetch_evaluaciones(db, watermark)
     addr_index = build_addr_index(evaluaciones)
-    print(f"Panel: {len(panel)} puntos | evaluaciones (stickers) en Firestore: {len(evaluaciones)}")
+    print(f"evaluaciones nuevas desde el watermark: {len(evaluaciones)}")
 
     now = datetime.now(timezone.utc)
-    points = []
-    for p in panel:
+    to_write = []
+    for p in candidates:
         r = cruce_sticker_punto(p["lat"], p["lon"], p["direccion"], evaluaciones, addr_index)
-        points.append({
+        did = doc_id(p["fuente"], p["registro_id"])
+        is_new = not state.get(did, {"exists": False})["exists"]
+        if not r["tiene_sticker"] and not is_new:
+            continue  # ya tenía doc 'pendiente'; sigue sin match -> nada cambió, no se reescribe
+        to_write.append({
             "fuente": p["fuente"], "registro_id": p["registro_id"],
             "tiene_sticker": r["tiene_sticker"], "tier": r["tier"],
             "sticker_dist_m": r["sticker_dist_m"], "direccion": p["direccion"],
@@ -315,17 +402,22 @@ def main() -> dict:
             "matched_at": now,
         })
 
-    n_con = sum(1 for x in points if x["tiene_sticker"])
-    print(f"con sticker: {n_con} ({n_con / len(points):.1%}) | faltantes: {len(points) - n_con}"
-          if points else "sin puntos de panel con coords")
-    summary = {"total": len(points), "con_sticker": n_con, "faltantes": len(points) - n_con}
+    n_nuevos_match = sum(1 for x in to_write if x["tiene_sticker"])
+    n_seed = sum(1 for x in to_write
+                if not state.get(doc_id(x["fuente"], x["registro_id"]), {"exists": False})["exists"])
+    print(f"docs a escribir: {len(to_write)} ({n_seed} nuevos, {n_nuevos_match} con match este run)")
+    summary = {"total_panel": len(panel), "ya_con_sticker": ya_con_sticker,
+              "candidatos": len(candidates), "a_escribir": len(to_write),
+              "nuevos_match": n_nuevos_match}
 
     if "--dry" in sys.argv:
-        print(f"[dry] no Firestore write; {len(points)} docs listos para {STICKER_MATCHES_COLLECTION}")
+        print(f"[dry] no Firestore write; {len(to_write)} docs listos para {STICKER_MATCHES_COLLECTION}")
         return summary
 
-    n = write_sticker_matches(db, points)
-    print(f"escritos {n} docs -> {db.project}/{STICKER_MATCHES_COLLECTION}")
+    existing_ids = {did for did, s in state.items() if s["exists"]}
+    n = write_sticker_matches(db, to_write, existing_ids)
+    write_watermark(db, now)
+    print(f"escritos {n} docs -> {db.project}/{STICKER_MATCHES_COLLECTION}; watermark avanzado a {now.isoformat()}")
     summary["escritos"] = n
     return summary
 
