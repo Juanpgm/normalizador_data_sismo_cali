@@ -53,7 +53,8 @@ BATCH_SIZE = 500        # Firestore batch-write / getAll chunk limit
 # merge:true; ADMIN_DEFAULT_FIELDS is seeded ONLY on a doc's first write, never
 # re-applied to a doc that already exists.
 PIPELINE_FIELDS = ("fuente", "registro_id", "tiene_sticker", "tier",
-                    "sticker_dist_m", "direccion", "coords", "zona_id", "matched_at")
+                    "sticker_dist_m", "direccion", "coords", "zona_id", "matched_at",
+                    "criterio_habitabilidad", "colapso")
 ADMIN_DEFAULT_FIELDS = {"estado_asignacion": "pendiente", "cuadrilla_id": None,
                         "inspector_uid": None}
 
@@ -81,6 +82,14 @@ def load_panel() -> list[dict]:
             continue
         fuente_raw = str(row.get("fuente") or "EDE").lower()
         fuente = "israel" if "israel" in fuente_raw else "ede"
+        # Colapso: single derived tag from the two EDE booleans (Israel points
+        # lack them -> "no"). Total wins over parcial when both are set.
+        if str(row.get("colapso_total") or "").lower() == "si":
+            colapso = "total"
+        elif str(row.get("colapso_parcial") or "").lower() == "si":
+            colapso = "parcial"
+        else:
+            colapso = "no"
         points.append({
             "fuente": fuente, "registro_id": str(registro_id),
             "lat": float(y), "lon": float(x),
@@ -88,6 +97,11 @@ def load_panel() -> list[dict]:
             # Best-effort zone tag; no KML/polygon lookup in Phase 1 scope —
             # comuna is the only zone-shaped field the Panel already carries.
             "zona_id": row.get("comuna") or None,
+            # Habitability + collapse from the EDE, surfaced to the assignment
+            # table and the inspector's pre-form cards so field crews see the
+            # criticality at a glance.
+            "criterio_habitabilidad": row.get("criterio_habitabilidad") or None,
+            "colapso": colapso,
         })
     return points
 
@@ -163,7 +177,9 @@ def build_write_ops(points: list[dict], existing_ids: set[str]) -> list[tuple[st
     ops = []
     for p in points:
         did = doc_id(p["fuente"], p["registro_id"])
-        fields = {k: p[k] for k in PIPELINE_FIELDS}
+        # .get so a point missing an optional pipeline field (e.g. Israel points
+        # have no habitability/colapso) writes None instead of crashing.
+        fields = {k: p.get(k) for k in PIPELINE_FIELDS}
         if did not in existing_ids:
             fields.update(ADMIN_DEFAULT_FIELDS)
         ops.append((did, fields))
