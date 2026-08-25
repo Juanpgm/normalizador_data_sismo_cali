@@ -19,8 +19,21 @@ public API so the whole fleet is reproducible instead of dashboard clicks.
 It creates a service shell and configures its schedule/command/policy. The code
 itself is deployed separately, per service, from this directory:
 
-    railway up --service integracion-f3
-    railway up --service asignaciones
+    railway up --service integracion-f3 --path-as-root .
+    railway up --service asignaciones --path-as-root .
+
+`--path-as-root .` is NOT optional — the Railway CLI's linked-project root can
+drift to the PARENT dashboard repo (its own `package.json`/`formulario/`/
+`services/photo-signer/` end up in the upload instead of this subproject's
+Dockerfile), independently of your shell's cwd; that's what silently broke
+`cruce-sticker` (38MB upload of the wrong tree, Railpack auto-detected Node
+from the leaked package.json files, every scheduled run crashed with "python:
+command not found", 2026-08-25 — a stuck `builder=RAILPACK` on the service
+instance looked like the cause at first but wasn't; deleting+recreating the
+service made no difference until `--path-as-root .` was added). Confirm with
+`--verbose` before trusting a deploy: it prints `bytes: N` — this subproject
+is under 1MB gitignored, so anything in the tens of MB means the wrong tree
+went up.
 
 The script is idempotent and safe to re-run: services are matched by name (an
 existing one is reused, never duplicated), and settings are written only when
@@ -97,11 +110,31 @@ SERVICES = [
     # every 15 min so sticker_matches.tiene_sticker stays current. Needs on
     # Railway: INSPECTIONS_URL (Blob inspections.json) + FIREBASE_SERVICE_ACCOUNT_JSON
     # (SA de sismo-agosto-sgred). Slots :07/:22/:37/:52 (lag tras el refresh).
+    # service_id: None — the old shell (3b786c3f-...) never deployed
+    # successfully (stuck on builder=RAILPACK, unclearable via the API — see
+    # COMMON's comment) and was deleted 2026-08-25; this recreates it fresh.
     {"name": "cruce-sticker", "start_command": "python job_sticker.py",
-     "cron": STICKER_EVERY_15, "service_id": "3b786c3f-7830-4708-aeb9-eb7a5c6aeee6"},
+     "cron": STICKER_EVERY_15, "service_id": None},
 ]
 
-COMMON = {"restartPolicyType": "NEVER", "numReplicas": 1}
+# builder: None (unset) is what lets Railway auto-detect the Dockerfile — the
+# `Builder` enum only lists ALTERNATIVE builders (HEROKU/NIXPACKS/PAKETO/
+# RAILPACK, confirmed via GraphQL introspection on ServiceInstanceUpdateInput),
+# there is no literal "DOCKERFILE" value to force. Every service, including a
+# brand-new never-deployed one, reports `builder: 'RAILPACK'` until its FIRST
+# successful build resolves what it actually used — that label alone is not a
+# sign of anything wrong; setting it to None here is inert (the API silently
+# ignores the write) but harmless, kept as a no-op guard in case a future
+# Railway API version does let it stick.
+#
+# The REAL cause of cruce-sticker's "python: command not found" crash-loop
+# (2026-08-25) had nothing to do with this field: `railway up` from
+# integracion_F1/ was uploading the DASHBOARD REPO ROOT instead (package.json,
+# formulario/, services/photo-signer/ all leaked in — Railpack correctly, from
+# its point of view, detected Node and built that). Deleting+recreating the
+# service made no difference. The fix is `--path-as-root .` on every `railway
+# up` — see the module docstring above.
+COMMON = {"restartPolicyType": "NEVER", "numReplicas": 1, "builder": None}
 
 
 def _token() -> str:
@@ -150,7 +183,7 @@ LIST_SERVICES = """query($p:String!){
 
 INSTANCE = """query($s:String!,$e:String!){
   serviceInstance(serviceId:$s, environmentId:$e){
-    cronSchedule startCommand restartPolicyType numReplicas } }"""
+    cronSchedule startCommand restartPolicyType numReplicas builder dockerfilePath } }"""
 
 CREATE = "mutation($in:ServiceCreateInput!){ serviceCreate(input:$in){ id } }"
 
