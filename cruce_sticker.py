@@ -293,6 +293,7 @@ def main() -> dict:
             "tiene_sticker": r["tiene_sticker"], "tier": r["tier"],
             "sticker_dist_m": r["sticker_dist_m"], "direccion": p["direccion"],
             "coords": {"lat": p["lat"], "lon": p["lon"]}, "zona_id": p["zona_id"],
+            "criterio_habitabilidad": p["criterio_habitabilidad"], "colapso": p["colapso"],
             "matched_at": now,
         })
 
