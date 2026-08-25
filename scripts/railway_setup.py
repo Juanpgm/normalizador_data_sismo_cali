@@ -96,7 +96,7 @@ SERVICES = [
     # INSPECTIONS_URL (Blob inspections.json) + FIREBASE_SERVICE_ACCOUNT_JSON
     # (SA de sismo-agosto-sgred). Minuto :20 para no chocar con los otros jobs.
     {"name": "cruce-sticker", "start_command": "python job_sticker.py",
-     "cron": STICKER_HOURLY_DAY, "service_id": None},
+     "cron": STICKER_HOURLY_DAY, "service_id": "3b786c3f-7830-4708-aeb9-eb7a5c6aeee6"},
 ]
 
 COMMON = {"restartPolicyType": "NEVER", "numReplicas": 1}
