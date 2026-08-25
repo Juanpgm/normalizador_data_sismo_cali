@@ -76,3 +76,61 @@ integracion/
 tests/              normalización, coords, guards, puente espacial, progreso
 run_integration.py  CLI
 ```
+
+## Protocolo F3 (cruce + asignaciones)
+
+Cruza la inspección **EDAN-F3** contra la tabla integrada de daños y produce el
+roster de trabajo de cuadrillas: qué sitios ya fueron visitados y cuáles faltan,
+ordenados por prioridad.
+
+Flujo de dos pasos con dependencia (asignar **lee** lo que escribe integrar):
+
+```
+tabla_integrada  ──integrar_f3──▶  integracion_f3  ──asignar_f3──▶  asignaciones
+ (EDAN SISMO)                        (EDAN-F3)                        (EDAN-F3)
+```
+
+Corrida on-demand, en orden y fail-fast, con un solo comando:
+
+```bash
+python protocolo_f3.py           # cruce + asignaciones (TODOS los pendientes)
+python protocolo_f3.py --dry     # sin escribir a Sheets (solo xlsx de salida)
+python protocolo_f3.py --top 100 # acota asignaciones a un worklist de 100
+```
+
+En producción cada paso corre además como cron independiente (Railway):
+`job_integrar_f3.py` cada 2 h, `job_asignaciones.py` diario 16:00 Bogotá.
+
+### Paso 1 — `integrar_f3.py` → tab `integracion_f3`
+Reusa la misma cascada de matching (arriba) framing `tabla_integrada` como lado
+EDAN y F3 como lado visitas. Una fila por registro (una por par cuando varios
+puntos F3 caen en el mismo registro):
+
+| Señal en la fila | Significado |
+|---|---|
+| `edan_id` con valor | el registro **ya hace match** con un punto F3 |
+| `edan_id` vacío | registro **pendiente**: sin F3 todavía |
+| `match_method = solo_f3` | punto F3 **nuevo** sin registro en `tabla_integrada` |
+
+### Paso 2 — `asignar_f3.py` → tab `asignaciones`
+Marca cada registro geolocalizado `visitado` (ya tiene F3 en `integracion_f3`) o
+`pendiente`, puntúa los pendientes 0-100 y los ordena por prioridad. Los
+visitados se conservan todos; los pendientes también (default sin tope) — usá
+`--top N` solo si querés un worklist acotado.
+
+Pesos del score (cada componente degrada a 0 si falta el dato):
+
+| Componente | Peso | Fuente |
+|---|---|---|
+| `grafo_severidad` | 30 | severidad NSR-10/AIS del daño (grafo `knowledge/kg.json`) |
+| `victimas` | 25 | 3·fallecidos + 2·atrapamientos + 1·rescatados (saturante) |
+| `antiguedad` | 20 | días desde el timestamp del formulario (min-max) |
+| `nivel_riesgo` | 10 | Alto 1.0 · Medio 0.6 · Bajo 0.3 |
+| `requiere_demolicion` | 10 | flag Sí/No |
+| `ola_zona` | 5 | ola de la zona KML de priorización (OLA 1 = 1.0, OLA 2 = 0.5) |
+
+**Salvedades:**
+- Los registros **sin coordenadas se excluyen** de `asignaciones`: no se puede
+  despachar una cuadrilla sin ubicación.
+- Además del tab, se exportan artefactos del dashboard a `web/data/`
+  (`asignaciones.json`, `zonas_asignacion.geojson`, `asignaciones.xlsx`).
