@@ -69,10 +69,12 @@ EVERY_15_OFFSET = "10,25,40,55 13-23,0 * * *"
 # horario alcanza y cuadruplicar escrituras a Sheets no aporta. Minuto :05 para
 # no chocar con los slots :00/:15/... ni :10/:25/... de los otros jobs.
 HOURLY_DAY = "5 13-23,0 * * *"
-# Cruce sticker↔Panel: cada hora en horario diurno de Colombia (13-23,0 UTC =
-# 08:00–19:59 COT), minuto :20 para no chocar con los slots :00/:15/:30/:45
-# (*/15) ni :05/:10/:25/:40/:55 de los otros jobs.
-STICKER_HOURLY_DAY = "20 13-23,0 * * *"
+# Cruce sticker↔Panel: cada 15 min en horario diurno de Colombia (13-23,0 UTC =
+# 08:00–19:59 COT). Corre desfasado a :07/:22/:37/:52 — unos minutos DESPUÉS de
+# que dashboard-refresh publica inspections.json (*/15 = :00/:15/:30/:45), para
+# leer Panel fresco. Escribe a Firestore (no a git), así que no hay riesgo de
+# pushear a main en el mismo minuto que otro job.
+STICKER_EVERY_15 = "7,22,37,52 13-23,0 * * *"
 
 SERVICES = [
     {"name": "normalizador", "start_command": "python job.py",
@@ -92,11 +94,11 @@ SERVICES = [
     {"name": "cruce-gestion", "start_command": "python job_cruce.py",
      "cron": EVERY_15_OFFSET, "service_id": "b4c8fd15-aa3b-4157-b787-2034c89a108b"},
     # Match stickers (evaluaciones, live from Firestore) against Panel points
-    # hourly so sticker_matches.tiene_sticker stays current. Needs on Railway:
-    # INSPECTIONS_URL (Blob inspections.json) + FIREBASE_SERVICE_ACCOUNT_JSON
-    # (SA de sismo-agosto-sgred). Minuto :20 para no chocar con los otros jobs.
+    # every 15 min so sticker_matches.tiene_sticker stays current. Needs on
+    # Railway: INSPECTIONS_URL (Blob inspections.json) + FIREBASE_SERVICE_ACCOUNT_JSON
+    # (SA de sismo-agosto-sgred). Slots :07/:22/:37/:52 (lag tras el refresh).
     {"name": "cruce-sticker", "start_command": "python job_sticker.py",
-     "cron": STICKER_HOURLY_DAY, "service_id": "3b786c3f-7830-4708-aeb9-eb7a5c6aeee6"},
+     "cron": STICKER_EVERY_15, "service_id": "3b786c3f-7830-4708-aeb9-eb7a5c6aeee6"},
 ]
 
 COMMON = {"restartPolicyType": "NEVER", "numReplicas": 1}
