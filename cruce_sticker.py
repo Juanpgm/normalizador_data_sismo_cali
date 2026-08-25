@@ -67,9 +67,27 @@ def doc_id(fuente: str, registro_id: str) -> str:
 
 
 # ── Panel loading (same as the notebook: EDE + Israel, EXIF-corrected coords) ─
+def _load_ede() -> list[dict]:
+    """EDE Panel points: the local web/data/inspections.json in dev, else the
+    Blob-published copy from $INSPECTIONS_URL — the Railway image has no web/, so
+    the hourly cron reads the fresh Panel over HTTP. Mirrors
+    cruce_criticos_survey.py's fallback. Raise (not silently 0 points) when
+    neither source is available, so a misconfigured service fails loud."""
+    if INSPECTIONS_JSON.exists():
+        return json.loads(INSPECTIONS_JSON.read_text(encoding="utf-8"))
+    url = os.environ.get("INSPECTIONS_URL", "").strip()
+    if not url:
+        raise RuntimeError(
+            f"{INSPECTIONS_JSON} no existe y no hay $INSPECTIONS_URL para bajarlo.")
+    import requests
+    return requests.get(url, timeout=60).json()
+
+
 def load_panel() -> list[dict]:
-    ede = (json.loads(INSPECTIONS_JSON.read_text(encoding="utf-8"))
-           if INSPECTIONS_JSON.exists() else [])
+    ede = _load_ede()
+    # Israel points are a static 101-point delegation set with no field stickers;
+    # only present locally, so they're skipped in the container (fine — the hourly
+    # cron refreshes the EDE Panel, which is what gains stickers).
     israel = (json.loads(ISRAEL_JSON.read_text(encoding="utf-8"))
               if ISRAEL_JSON.exists() else [])
     points = []

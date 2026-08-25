@@ -19,7 +19,8 @@ COPY integracion/ ./integracion/
 COPY basemaps/ ./basemaps/
 COPY job.py run_integration.py \
      integrar_f3.py asignar_f3.py job_integrar_f3.py job_asignaciones.py \
-     cruce_criticos_survey.py subir_cruce_firebase.py job_cruce.py ./
+     cruce_criticos_survey.py subir_cruce_firebase.py job_cruce.py \
+     cruce_gestor.py cruce_sticker.py job_sticker.py ./
 
 # Logs land on the mounted volume; the job degrades to stdout-only if absent.
 ENV LOG_DIR=/data/logs

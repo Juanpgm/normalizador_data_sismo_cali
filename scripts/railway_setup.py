@@ -69,6 +69,10 @@ EVERY_15_OFFSET = "10,25,40,55 13-23,0 * * *"
 # horario alcanza y cuadruplicar escrituras a Sheets no aporta. Minuto :05 para
 # no chocar con los slots :00/:15/... ni :10/:25/... de los otros jobs.
 HOURLY_DAY = "5 13-23,0 * * *"
+# Cruce sticker↔Panel: cada hora en horario diurno de Colombia (13-23,0 UTC =
+# 08:00–19:59 COT), minuto :20 para no chocar con los slots :00/:15/:30/:45
+# (*/15) ni :05/:10/:25/:40/:55 de los otros jobs.
+STICKER_HOURLY_DAY = "20 13-23,0 * * *"
 
 SERVICES = [
     {"name": "normalizador", "start_command": "python job.py",
@@ -87,6 +91,12 @@ SERVICES = [
     # (inspections.json publicado en Vercel).
     {"name": "cruce-gestion", "start_command": "python job_cruce.py",
      "cron": EVERY_15_OFFSET, "service_id": "b4c8fd15-aa3b-4157-b787-2034c89a108b"},
+    # Match stickers (evaluaciones, live from Firestore) against Panel points
+    # hourly so sticker_matches.tiene_sticker stays current. Needs on Railway:
+    # INSPECTIONS_URL (Blob inspections.json) + FIREBASE_SERVICE_ACCOUNT_JSON
+    # (SA de sismo-agosto-sgred). Minuto :20 para no chocar con los otros jobs.
+    {"name": "cruce-sticker", "start_command": "python job_sticker.py",
+     "cron": STICKER_HOURLY_DAY, "service_id": None},
 ]
 
 COMMON = {"restartPolicyType": "NEVER", "numReplicas": 1}
