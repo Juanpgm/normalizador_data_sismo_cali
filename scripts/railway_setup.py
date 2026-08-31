@@ -1,4 +1,16 @@
-"""Provision and configure the Railway cron services for this project.
+"""DECOMMISSIONED (2026-08-31) — kept for historical reference only.
+
+The legacy fleet this script provisioned (`normalizador`, `integracion-f3`,
+`asignaciones`, `cruce-gestion`, plus the pre-consolidation `cruce-sticker`)
+was deleted from Railway in the fase-0 cleanup (see
+openspec/changes/archive/2026-08-31-railway-fase0-cleanup/). Re-running this
+script would RECREATE those deleted services by name and reschedule them.
+The guard below makes it exit instead. Current source of truth:
+backend/scripts/railway_services.py.
+
+--- original docstring ---
+
+Provision and configure the Railway cron services for this project.
 
 The `normalizador-sismo-cali` project has one environment (production) and is
 deployed by CLI upload (`railway up`), not from a connected git repo. All cron
@@ -47,6 +59,12 @@ they drift from the desired state.
 Auth comes from the Railway CLI session (`railway login`), or RAILWAY_API_TOKEN.
 """
 from __future__ import annotations
+
+import sys
+
+sys.exit("DECOMMISSIONED: this script would recreate the Railway services "
+         "deleted in the 2026-08-31 fase-0 cleanup. Use "
+         "backend/scripts/railway_services.py instead.")
 
 import argparse
 import json
